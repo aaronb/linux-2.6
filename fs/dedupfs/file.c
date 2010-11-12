@@ -15,93 +15,71 @@
  *  dedupfs fs regular file handling primitives
  *
  *  64-bit file support on 64-bit platforms by Jakub Jelinek
- * 	(jj@sunsite.ms.mff.cuni.cz)
+ *	(jj@sunsite.ms.mff.cuni.cz)
  */
 
 #include <linux/time.h>
-#include <linux/pagemap.h>
+#include <linux/fs.h>
+#include <linux/jbd.h>
 #include <linux/quotaops.h>
 #include "dedupfs.h"
+#include "dedupfs_jbd.h"
 #include "xattr.h"
 #include "acl.h"
 
 /*
- * Called when filp is released. This happens when all file descriptors
- * for a single struct file are closed. Note that different open() calls
- * for the same file yield different struct file structures.
+ * Called when an inode is released. Note that this is different
+ * from dedupfs_file_open: open gets called at every open, but release
+ * gets called only when /all/ the files are closed.
  */
 static int dedupfs_release_file (struct inode * inode, struct file * filp)
 {
-	if (filp->f_mode & FMODE_WRITE) {
+	if (dedupfs_test_inode_state(inode, DEDUPFS_STATE_FLUSH_ON_CLOSE)) {
+		filemap_flush(inode->i_mapping);
+		dedupfs_clear_inode_state(inode, DEDUPFS_STATE_FLUSH_ON_CLOSE);
+	}
+	/* if we are the last writer on the inode, drop the block reservation */
+	if ((filp->f_mode & FMODE_WRITE) &&
+			(atomic_read(&inode->i_writecount) == 1))
+	{
 		mutex_lock(&DEDUPFS_I(inode)->truncate_mutex);
 		dedupfs_discard_reservation(inode);
 		mutex_unlock(&DEDUPFS_I(inode)->truncate_mutex);
 	}
+	if (is_dx(inode) && filp->private_data)
+		dedupfs_htree_free_dir_info(filp->private_data);
+
 	return 0;
 }
 
-int dedupfs_fsync(struct file *file, int datasync)
-{
-	int ret;
-	struct super_block *sb = file->f_mapping->host->i_sb;
-	struct address_space *mapping = sb->s_bdev->bd_inode->i_mapping;
-
-	ret = generic_file_fsync(file, datasync);
-	if (ret == -EIO || test_and_clear_bit(AS_EIO, &mapping->flags)) {
-		/* We don't really know where the IO error happened... */
-		dedupfs_error(sb, __func__,
-			   "detected IO error when writing metadata buffers");
-		ret = -EIO;
-	}
-	return ret;
-}
-
-/*
- * We have mostly NULL's here: the current defaults are ok for
- * the dedupfs filesystem.
- */
 const struct file_operations dedupfs_file_operations = {
 	.llseek		= generic_file_llseek,
 	.read		= do_sync_read,
 	.write		= do_sync_write,
 	.aio_read	= generic_file_aio_read,
 	.aio_write	= generic_file_aio_write,
-	.unlocked_ioctl = dedupfs_ioctl,
+	.unlocked_ioctl	= dedupfs_ioctl,
 #ifdef CONFIG_COMPAT
 	.compat_ioctl	= dedupfs_compat_ioctl,
 #endif
 	.mmap		= generic_file_mmap,
 	.open		= dquot_file_open,
 	.release	= dedupfs_release_file,
-	.fsync		= dedupfs_fsync,
+	.fsync		= dedupfs_sync_file,
 	.splice_read	= generic_file_splice_read,
 	.splice_write	= generic_file_splice_write,
 };
 
-#ifdef CONFIG_DEDUPFS_XIP
-const struct file_operations dedupfs_xip_file_operations = {
-	.llseek		= generic_file_llseek,
-	.read		= xip_file_read,
-	.write		= xip_file_write,
-	.unlocked_ioctl = dedupfs_ioctl,
-#ifdef CONFIG_COMPAT
-	.compat_ioctl	= dedupfs_compat_ioctl,
-#endif
-	.mmap		= xip_file_mmap,
-	.open		= dquot_file_open,
-	.release	= dedupfs_release_file,
-	.fsync		= dedupfs_fsync,
-};
-#endif
-
 const struct inode_operations dedupfs_file_inode_operations = {
+	.truncate	= dedupfs_truncate,
+	.setattr	= dedupfs_setattr,
 #ifdef CONFIG_DEDUPFS_XATTR
 	.setxattr	= generic_setxattr,
 	.getxattr	= generic_getxattr,
 	.listxattr	= dedupfs_listxattr,
 	.removexattr	= generic_removexattr,
 #endif
-	.setattr	= dedupfs_setattr,
 	.check_acl	= dedupfs_check_acl,
 	.fiemap		= dedupfs_fiemap,
 };
+

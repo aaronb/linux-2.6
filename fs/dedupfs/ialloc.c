@@ -6,18 +6,26 @@
  * Laboratoire MASI - Institut Blaise Pascal
  * Universite Pierre et Marie Curie (Paris VI)
  *
- *  BSD ufs-inspired inode and directory allocation by 
- *  Stephen Tweedie (sct@dcs.ed.ac.uk), 1993
+ *  BSD ufs-inspired inode and directory allocation by
+ *  Stephen Tweedie (sct@redhat.com), 1993
  *  Big-endian to little-endian byte-swapping/bitmaps by
  *        David S. Miller (davem@caip.rutgers.edu), 1995
  */
 
+#include <linux/time.h>
+#include <linux/fs.h>
+#include <linux/jbd.h>
+#include "dedupfs.h"
+#include "dedupfs_jbd.h"
+#include <linux/stat.h>
+#include <linux/string.h>
 #include <linux/quotaops.h>
-#include <linux/sched.h>
-#include <linux/backing-dev.h>
 #include <linux/buffer_head.h>
 #include <linux/random.h>
-#include "dedupfs.h"
+#include <linux/bitops.h>
+
+#include <asm/byteorder.h>
+
 #include "xattr.h"
 #include "acl.h"
 
@@ -62,29 +70,6 @@ error_out:
 	return bh;
 }
 
-static void dedupfs_release_inode(struct super_block *sb, int group, int dir)
-{
-	struct dedupfs_group_desc * desc;
-	struct buffer_head *bh;
-
-	desc = dedupfs_get_group_desc(sb, group, &bh);
-	if (!desc) {
-		dedupfs_error(sb, "dedupfs_release_inode",
-			"can't get descriptor for group %d", group);
-		return;
-	}
-
-	spin_lock(sb_bgl_lock(DEDUPFS_SB(sb), group));
-	le16_add_cpu(&desc->bg_free_inodes_count, 1);
-	if (dir)
-		le16_add_cpu(&desc->bg_used_dirs_count, -1);
-	spin_unlock(sb_bgl_lock(DEDUPFS_SB(sb), group));
-	if (dir)
-		percpu_counter_dec(&DEDUPFS_SB(sb)->s_dirs_counter);
-	sb->s_dirt = 1;
-	mark_buffer_dirty(bh);
-}
-
 /*
  * NOTE! When we get the inode, we're the only people
  * that have access to it, and as such there are no
@@ -101,96 +86,93 @@ static void dedupfs_release_inode(struct super_block *sb, int group, int dir)
  * though), and then we'd have two inodes sharing the
  * same inode number and space on the harddisk.
  */
-void dedupfs_free_inode (struct inode * inode)
+void dedupfs_free_inode (handle_t *handle, struct inode * inode)
 {
 	struct super_block * sb = inode->i_sb;
 	int is_directory;
 	unsigned long ino;
-	struct buffer_head *bitmap_bh;
+	struct buffer_head *bitmap_bh = NULL;
+	struct buffer_head *bh2;
 	unsigned long block_group;
 	unsigned long bit;
+	struct dedupfs_group_desc * gdp;
 	struct dedupfs_super_block * es;
+	struct dedupfs_sb_info *sbi;
+	int fatal = 0, err;
+
+	if (atomic_read(&inode->i_count) > 1) {
+		printk ("dedupfs_free_inode: inode has count=%d\n",
+					atomic_read(&inode->i_count));
+		return;
+	}
+	if (inode->i_nlink) {
+		printk ("dedupfs_free_inode: inode has nlink=%d\n",
+			inode->i_nlink);
+		return;
+	}
+	if (!sb) {
+		printk("dedupfs_free_inode: inode on nonexistent device\n");
+		return;
+	}
+	sbi = DEDUPFS_SB(sb);
 
 	ino = inode->i_ino;
 	dedupfs_debug ("freeing inode %lu\n", ino);
 
-	/*
-	 * Note: we must free any quota before locking the superblock,
-	 * as writing the quota to disk may need the lock as well.
-	 */
-	/* Quota is already initialized in iput() */
-	dedupfs_xattr_delete_inode(inode);
-	dquot_free_inode(inode);
-	dquot_drop(inode);
-
-	es = DEDUPFS_SB(sb)->s_es;
 	is_directory = S_ISDIR(inode->i_mode);
 
-	if (ino < DEDUPFS_FIRST_INO(sb) ||
-	    ino > le32_to_cpu(es->s_inodes_count)) {
+	es = DEDUPFS_SB(sb)->s_es;
+	if (ino < DEDUPFS_FIRST_INO(sb) || ino > le32_to_cpu(es->s_inodes_count)) {
 		dedupfs_error (sb, "dedupfs_free_inode",
 			    "reserved or nonexistent inode %lu", ino);
-		return;
+		goto error_return;
 	}
 	block_group = (ino - 1) / DEDUPFS_INODES_PER_GROUP(sb);
 	bit = (ino - 1) % DEDUPFS_INODES_PER_GROUP(sb);
 	bitmap_bh = read_inode_bitmap(sb, block_group);
 	if (!bitmap_bh)
-		return;
+		goto error_return;
+
+	BUFFER_TRACE(bitmap_bh, "get_write_access");
+	fatal = dedupfs_journal_get_write_access(handle, bitmap_bh);
+	if (fatal)
+		goto error_return;
 
 	/* Ok, now we can actually update the inode bitmaps.. */
-	if (!dedupfs_clear_bit_atomic(sb_bgl_lock(DEDUPFS_SB(sb), block_group),
-				bit, (void *) bitmap_bh->b_data))
+	if (!dedupfs_clear_bit_atomic(sb_bgl_lock(sbi, block_group),
+					bit, bitmap_bh->b_data))
 		dedupfs_error (sb, "dedupfs_free_inode",
 			      "bit already cleared for inode %lu", ino);
-	else
-		dedupfs_release_inode(sb, block_group, is_directory);
-	mark_buffer_dirty(bitmap_bh);
-	if (sb->s_flags & MS_SYNCHRONOUS)
-		sync_dirty_buffer(bitmap_bh);
+	else {
+		gdp = dedupfs_get_group_desc (sb, block_group, &bh2);
 
+		BUFFER_TRACE(bh2, "get_write_access");
+		fatal = dedupfs_journal_get_write_access(handle, bh2);
+		if (fatal) goto error_return;
+
+		if (gdp) {
+			spin_lock(sb_bgl_lock(sbi, block_group));
+			le16_add_cpu(&gdp->bg_free_inodes_count, 1);
+			if (is_directory)
+				le16_add_cpu(&gdp->bg_used_dirs_count, -1);
+			spin_unlock(sb_bgl_lock(sbi, block_group));
+			percpu_counter_inc(&sbi->s_freeinodes_counter);
+			if (is_directory)
+				percpu_counter_dec(&sbi->s_dirs_counter);
+
+		}
+		BUFFER_TRACE(bh2, "call dedupfs_journal_dirty_metadata");
+		err = dedupfs_journal_dirty_metadata(handle, bh2);
+		if (!fatal) fatal = err;
+	}
+	BUFFER_TRACE(bitmap_bh, "call dedupfs_journal_dirty_metadata");
+	err = dedupfs_journal_dirty_metadata(handle, bitmap_bh);
+	if (!fatal)
+		fatal = err;
+
+error_return:
 	brelse(bitmap_bh);
-}
-
-/*
- * We perform asynchronous prereading of the new inode's inode block when
- * we create the inode, in the expectation that the inode will be written
- * back soon.  There are two reasons:
- *
- * - When creating a large number of files, the async prereads will be
- *   nicely merged into large reads
- * - When writing out a large number of inodes, we don't need to keep on
- *   stalling the writes while we read the inode block.
- *
- * FIXME: dedupfs_get_group_desc() needs to be simplified.
- */
-static void dedupfs_preread_inode(struct inode *inode)
-{
-	unsigned long block_group;
-	unsigned long offset;
-	unsigned long block;
-	struct dedupfs_group_desc * gdp;
-	struct backing_dev_info *bdi;
-
-	bdi = inode->i_mapping->backing_dev_info;
-	if (bdi_read_congested(bdi))
-		return;
-	if (bdi_write_congested(bdi))
-		return;
-
-	block_group = (inode->i_ino - 1) / DEDUPFS_INODES_PER_GROUP(inode->i_sb);
-	gdp = dedupfs_get_group_desc(inode->i_sb, block_group, NULL);
-	if (gdp == NULL)
-		return;
-
-	/*
-	 * Figure out the offset within the block group inode table
-	 */
-	offset = ((inode->i_ino - 1) % DEDUPFS_INODES_PER_GROUP(inode->i_sb)) *
-				DEDUPFS_INODE_SIZE(inode->i_sb);
-	block = le32_to_cpu(gdp->bg_inode_table) +
-				(offset >> DEDUPFS_BLOCK_SIZE_BITS(inode->i_sb));
-	sb_breadahead(inode->i_sb, block);
+	dedupfs_std_error(sb, fatal);
 }
 
 /*
@@ -206,9 +188,12 @@ static void dedupfs_preread_inode(struct inode *inode)
 static int find_group_dir(struct super_block *sb, struct inode *parent)
 {
 	int ngroups = DEDUPFS_SB(sb)->s_groups_count;
-	int avefreei = dedupfs_count_free_inodes(sb) / ngroups;
+	unsigned int freei, avefreei;
 	struct dedupfs_group_desc *desc, *best_desc = NULL;
 	int group, best_group = -1;
+
+	freei = percpu_counter_read_positive(&DEDUPFS_SB(sb)->s_freeinodes_counter);
+	avefreei = freei / ngroups;
 
 	for (group = 0; group < ngroups; group++) {
 		desc = dedupfs_get_group_desc (sb, group, NULL);
@@ -216,43 +201,40 @@ static int find_group_dir(struct super_block *sb, struct inode *parent)
 			continue;
 		if (le16_to_cpu(desc->bg_free_inodes_count) < avefreei)
 			continue;
-		if (!best_desc || 
+		if (!best_desc ||
 		    (le16_to_cpu(desc->bg_free_blocks_count) >
 		     le16_to_cpu(best_desc->bg_free_blocks_count))) {
 			best_group = group;
 			best_desc = desc;
 		}
 	}
-	if (!best_desc)
-		return -1;
-
 	return best_group;
 }
 
-/* 
- * Orlov's allocator for directories. 
- * 
+/*
+ * Orlov's allocator for directories.
+ *
  * We always try to spread first-level directories.
  *
- * If there are blockgroups with both free inodes and free blocks counts 
- * not worse than average we return one with smallest directory count. 
- * Otherwise we simply return a random group. 
- * 
- * For the rest rules look so: 
- * 
- * It's OK to put directory into a group unless 
- * it has too many directories already (max_dirs) or 
- * it has too few free inodes left (min_inodes) or 
- * it has too few free blocks left (min_blocks) or 
- * it's already running too large debt (max_debt). 
- * Parent's group is preferred, if it doesn't satisfy these 
- * conditions we search cyclically through the rest. If none 
- * of the groups look good we just look for a group with more 
- * free inodes than average (starting at parent's group). 
- * 
- * Debt is incremented each time we allocate a directory and decremented 
- * when we allocate an inode, within 0--255. 
- */ 
+ * If there are blockgroups with both free inodes and free blocks counts
+ * not worse than average we return one with smallest directory count.
+ * Otherwise we simply return a random group.
+ *
+ * For the rest rules look so:
+ *
+ * It's OK to put directory into a group unless
+ * it has too many directories already (max_dirs) or
+ * it has too few free inodes left (min_inodes) or
+ * it has too few free blocks left (min_blocks) or
+ * it's already running too large debt (max_debt).
+ * Parent's group is preferred, if it doesn't satisfy these
+ * conditions we search cyclically through the rest. If none
+ * of the groups look good we just look for a group with more
+ * free inodes than average (starting at parent's group).
+ *
+ * Debt is incremented each time we allocate a directory and decremented
+ * when we allocate an inode, within 0--255.
+ */
 
 #define INODE_COST 64
 #define BLOCK_COST 256
@@ -264,25 +246,23 @@ static int find_group_orlov(struct super_block *sb, struct inode *parent)
 	struct dedupfs_super_block *es = sbi->s_es;
 	int ngroups = sbi->s_groups_count;
 	int inodes_per_group = DEDUPFS_INODES_PER_GROUP(sb);
-	int freei;
-	int avefreei;
-	int free_blocks;
-	int avefreeb;
-	int blocks_per_dir;
-	int ndirs;
-	int max_debt, max_dirs, min_blocks, min_inodes;
+	unsigned int freei, avefreei;
+	dedupfsblk_t freeb, avefreeb;
+	dedupfsblk_t blocks_per_dir;
+	unsigned int ndirs;
+	int max_debt, max_dirs, min_inodes;
+	dedupfs_grpblk_t min_blocks;
 	int group = -1, i;
 	struct dedupfs_group_desc *desc;
 
 	freei = percpu_counter_read_positive(&sbi->s_freeinodes_counter);
 	avefreei = freei / ngroups;
-	free_blocks = percpu_counter_read_positive(&sbi->s_freeblocks_counter);
-	avefreeb = free_blocks / ngroups;
+	freeb = percpu_counter_read_positive(&sbi->s_freeblocks_counter);
+	avefreeb = freeb / ngroups;
 	ndirs = percpu_counter_read_positive(&sbi->s_dirs_counter);
 
 	if ((parent == sb->s_root->d_inode) ||
 	    (DEDUPFS_I(parent)->i_flags & DEDUPFS_TOPDIR_FL)) {
-		struct dedupfs_group_desc *best_desc = NULL;
 		int best_ndir = inodes_per_group;
 		int best_group = -1;
 
@@ -301,26 +281,19 @@ static int find_group_orlov(struct super_block *sb, struct inode *parent)
 				continue;
 			best_group = group;
 			best_ndir = le16_to_cpu(desc->bg_used_dirs_count);
-			best_desc = desc;
 		}
-		if (best_group >= 0) {
-			desc = best_desc;
-			group = best_group;
-			goto found;
-		}
+		if (best_group >= 0)
+			return best_group;
 		goto fallback;
 	}
 
-	if (ndirs == 0)
-		ndirs = 1;	/* percpu_counters are approximate... */
-
-	blocks_per_dir = (le32_to_cpu(es->s_blocks_count)-free_blocks) / ndirs;
+	blocks_per_dir = (le32_to_cpu(es->s_blocks_count) - freeb) / ndirs;
 
 	max_dirs = ndirs / ngroups + inodes_per_group / 16;
 	min_inodes = avefreei - inodes_per_group / 4;
 	min_blocks = avefreeb - DEDUPFS_BLOCKS_PER_GROUP(sb) / 4;
 
-	max_debt = DEDUPFS_BLOCKS_PER_GROUP(sb) / max(blocks_per_dir, BLOCK_COST);
+	max_debt = DEDUPFS_BLOCKS_PER_GROUP(sb) / max(blocks_per_dir, (dedupfsblk_t)BLOCK_COST);
 	if (max_debt * INODE_COST > inodes_per_group)
 		max_debt = inodes_per_group / INODE_COST;
 	if (max_debt > 255)
@@ -333,15 +306,13 @@ static int find_group_orlov(struct super_block *sb, struct inode *parent)
 		desc = dedupfs_get_group_desc (sb, group, NULL);
 		if (!desc || !desc->bg_free_inodes_count)
 			continue;
-		if (sbi->s_debts[group] >= max_debt)
-			continue;
 		if (le16_to_cpu(desc->bg_used_dirs_count) >= max_dirs)
 			continue;
 		if (le16_to_cpu(desc->bg_free_inodes_count) < min_inodes)
 			continue;
 		if (le16_to_cpu(desc->bg_free_blocks_count) < min_blocks)
 			continue;
-		goto found;
+		return group;
 	}
 
 fallback:
@@ -351,7 +322,7 @@ fallback:
 		if (!desc || !desc->bg_free_inodes_count)
 			continue;
 		if (le16_to_cpu(desc->bg_free_inodes_count) >= avefreei)
-			goto found;
+			return group;
 	}
 
 	if (avefreei) {
@@ -364,9 +335,6 @@ fallback:
 	}
 
 	return -1;
-
-found:
-	return group;
 }
 
 static int find_group_other(struct super_block *sb, struct inode *parent)
@@ -383,7 +351,7 @@ static int find_group_other(struct super_block *sb, struct inode *parent)
 	desc = dedupfs_get_group_desc (sb, group, NULL);
 	if (desc && le16_to_cpu(desc->bg_free_inodes_count) &&
 			le16_to_cpu(desc->bg_free_blocks_count))
-		goto found;
+		return group;
 
 	/*
 	 * We're going to place this inode in a different blockgroup from its
@@ -397,8 +365,8 @@ static int find_group_other(struct super_block *sb, struct inode *parent)
 	group = (group + parent->i_ino) % ngroups;
 
 	/*
-	 * Use a quadratic hash to find a group with a free inode and some
-	 * free blocks.
+	 * Use a quadratic hash to find a group with a free inode and some free
+	 * blocks.
 	 */
 	for (i = 1; i < ngroups; i <<= 1) {
 		group += i;
@@ -407,7 +375,7 @@ static int find_group_other(struct super_block *sb, struct inode *parent)
 		desc = dedupfs_get_group_desc (sb, group, NULL);
 		if (desc && le16_to_cpu(desc->bg_free_inodes_count) &&
 				le16_to_cpu(desc->bg_free_blocks_count))
-			goto found;
+			return group;
 	}
 
 	/*
@@ -420,130 +388,145 @@ static int find_group_other(struct super_block *sb, struct inode *parent)
 			group = 0;
 		desc = dedupfs_get_group_desc (sb, group, NULL);
 		if (desc && le16_to_cpu(desc->bg_free_inodes_count))
-			goto found;
+			return group;
 	}
 
 	return -1;
-
-found:
-	return group;
 }
 
-struct inode *dedupfs_new_inode(struct inode *dir, int mode)
+/*
+ * There are two policies for allocating an inode.  If the new inode is
+ * a directory, then a forward search is made for a block group with both
+ * free space and a low directory-to-inode ratio; if that fails, then of
+ * the groups with above-average free space, that group with the fewest
+ * directories already is chosen.
+ *
+ * For other inodes, search forward from the parent directory's block
+ * group to find a free inode.
+ */
+struct inode *dedupfs_new_inode(handle_t *handle, struct inode * dir, int mode)
 {
 	struct super_block *sb;
 	struct buffer_head *bitmap_bh = NULL;
 	struct buffer_head *bh2;
-	int group, i;
-	ino_t ino = 0;
+	int group;
+	unsigned long ino = 0;
 	struct inode * inode;
-	struct dedupfs_group_desc *gdp;
-	struct dedupfs_super_block *es;
+	struct dedupfs_group_desc * gdp = NULL;
+	struct dedupfs_super_block * es;
 	struct dedupfs_inode_info *ei;
 	struct dedupfs_sb_info *sbi;
-	int err;
+	int err = 0;
+	struct inode *ret;
+	int i;
+
+	/* Cannot create files in a deleted directory */
+	if (!dir || !dir->i_nlink)
+		return ERR_PTR(-EPERM);
 
 	sb = dir->i_sb;
 	inode = new_inode(sb);
 	if (!inode)
 		return ERR_PTR(-ENOMEM);
-
 	ei = DEDUPFS_I(inode);
+
 	sbi = DEDUPFS_SB(sb);
 	es = sbi->s_es;
 	if (S_ISDIR(mode)) {
-		if (test_opt(sb, OLDALLOC))
+		if (test_opt (sb, OLDALLOC))
 			group = find_group_dir(sb, dir);
 		else
 			group = find_group_orlov(sb, dir);
-	} else 
+	} else
 		group = find_group_other(sb, dir);
 
-	if (group == -1) {
-		err = -ENOSPC;
-		goto fail;
-	}
+	err = -ENOSPC;
+	if (group == -1)
+		goto out;
 
 	for (i = 0; i < sbi->s_groups_count; i++) {
+		err = -EIO;
+
 		gdp = dedupfs_get_group_desc(sb, group, &bh2);
+		if (!gdp)
+			goto fail;
+
 		brelse(bitmap_bh);
 		bitmap_bh = read_inode_bitmap(sb, group);
-		if (!bitmap_bh) {
-			err = -EIO;
+		if (!bitmap_bh)
 			goto fail;
-		}
+
 		ino = 0;
 
 repeat_in_this_group:
-		ino = dedupfs_find_next_zero_bit((unsigned long *)bitmap_bh->b_data,
-					      DEDUPFS_INODES_PER_GROUP(sb), ino);
-		if (ino >= DEDUPFS_INODES_PER_GROUP(sb)) {
-			/*
-			 * Rare race: find_group_xx() decided that there were
-			 * free inodes in this group, but by the time we tried
-			 * to allocate one, they're all gone.  This can also
-			 * occur because the counters which find_group_orlov()
-			 * uses are approximate.  So just go and search the
-			 * next block group.
-			 */
-			if (++group == sbi->s_groups_count)
-				group = 0;
-			continue;
-		}
-		if (dedupfs_set_bit_atomic(sb_bgl_lock(sbi, group),
+		ino = dedupfs_find_next_zero_bit((unsigned long *)
+				bitmap_bh->b_data, DEDUPFS_INODES_PER_GROUP(sb), ino);
+		if (ino < DEDUPFS_INODES_PER_GROUP(sb)) {
+
+			BUFFER_TRACE(bitmap_bh, "get_write_access");
+			err = dedupfs_journal_get_write_access(handle, bitmap_bh);
+			if (err)
+				goto fail;
+
+			if (!dedupfs_set_bit_atomic(sb_bgl_lock(sbi, group),
 						ino, bitmap_bh->b_data)) {
-			/* we lost this inode */
-			if (++ino >= DEDUPFS_INODES_PER_GROUP(sb)) {
-				/* this group is exhausted, try next group */
-				if (++group == sbi->s_groups_count)
-					group = 0;
-				continue;
+				/* we won it */
+				BUFFER_TRACE(bitmap_bh,
+					"call dedupfs_journal_dirty_metadata");
+				err = dedupfs_journal_dirty_metadata(handle,
+								bitmap_bh);
+				if (err)
+					goto fail;
+				goto got;
 			}
-			/* try to find free inode in the same group */
-			goto repeat_in_this_group;
+			/* we lost it */
+			journal_release_buffer(handle, bitmap_bh);
+
+			if (++ino < DEDUPFS_INODES_PER_GROUP(sb))
+				goto repeat_in_this_group;
 		}
-		goto got;
+
+		/*
+		 * This case is possible in concurrent environment.  It is very
+		 * rare.  We cannot repeat the find_group_xxx() call because
+		 * that will simply return the same blockgroup, because the
+		 * group descriptor metadata has not yet been updated.
+		 * So we just go onto the next blockgroup.
+		 */
+		if (++group == sbi->s_groups_count)
+			group = 0;
 	}
-
-	/*
-	 * Scanned all blockgroups.
-	 */
 	err = -ENOSPC;
-	goto fail;
-got:
-	mark_buffer_dirty(bitmap_bh);
-	if (sb->s_flags & MS_SYNCHRONOUS)
-		sync_dirty_buffer(bitmap_bh);
-	brelse(bitmap_bh);
+	goto out;
 
+got:
 	ino += group * DEDUPFS_INODES_PER_GROUP(sb) + 1;
 	if (ino < DEDUPFS_FIRST_INO(sb) || ino > le32_to_cpu(es->s_inodes_count)) {
 		dedupfs_error (sb, "dedupfs_new_inode",
 			    "reserved inode or inode > inodes count - "
-			    "block_group = %d,inode=%lu", group,
-			    (unsigned long) ino);
+			    "block_group = %d, inode=%lu", group, ino);
 		err = -EIO;
 		goto fail;
 	}
 
-	percpu_counter_add(&sbi->s_freeinodes_counter, -1);
-	if (S_ISDIR(mode))
-		percpu_counter_inc(&sbi->s_dirs_counter);
-
+	BUFFER_TRACE(bh2, "get_write_access");
+	err = dedupfs_journal_get_write_access(handle, bh2);
+	if (err) goto fail;
 	spin_lock(sb_bgl_lock(sbi, group));
 	le16_add_cpu(&gdp->bg_free_inodes_count, -1);
 	if (S_ISDIR(mode)) {
-		if (sbi->s_debts[group] < 255)
-			sbi->s_debts[group]++;
 		le16_add_cpu(&gdp->bg_used_dirs_count, 1);
-	} else {
-		if (sbi->s_debts[group])
-			sbi->s_debts[group]--;
 	}
 	spin_unlock(sb_bgl_lock(sbi, group));
+	BUFFER_TRACE(bh2, "call dedupfs_journal_dirty_metadata");
+	err = dedupfs_journal_dirty_metadata(handle, bh2);
+	if (err) goto fail;
 
-	sb->s_dirt = 1;
-	mark_buffer_dirty(bh2);
+	percpu_counter_dec(&sbi->s_freeinodes_counter);
+	if (S_ISDIR(mode))
+		percpu_counter_inc(&sbi->s_dirs_counter);
+
+
 	if (test_opt(sb, GRPID)) {
 		inode->i_mode = mode;
 		inode->i_uid = current_fsuid();
@@ -552,47 +535,75 @@ got:
 		inode_init_owner(inode, dir, mode);
 
 	inode->i_ino = ino;
+	/* This is the optimal IO size (for stat), not the fs block size */
 	inode->i_blocks = 0;
 	inode->i_mtime = inode->i_atime = inode->i_ctime = CURRENT_TIME_SEC;
+
 	memset(ei->i_data, 0, sizeof(ei->i_data));
+	ei->i_dir_start_lookup = 0;
+	ei->i_disksize = 0;
+
 	ei->i_flags =
 		dedupfs_mask_flags(mode, DEDUPFS_I(dir)->i_flags & DEDUPFS_FL_INHERITED);
+#ifdef DEDUPFS_FRAGMENTS
 	ei->i_faddr = 0;
 	ei->i_frag_no = 0;
 	ei->i_frag_size = 0;
+#endif
 	ei->i_file_acl = 0;
 	ei->i_dir_acl = 0;
 	ei->i_dtime = 0;
 	ei->i_block_alloc_info = NULL;
 	ei->i_block_group = group;
-	ei->i_dir_start_lookup = 0;
-	ei->i_state = DEDUPFS_STATE_NEW;
+
 	dedupfs_set_inode_flags(inode);
-	spin_lock(&sbi->s_next_gen_lock);
-	inode->i_generation = sbi->s_next_generation++;
-	spin_unlock(&sbi->s_next_gen_lock);
+	if (IS_DIRSYNC(inode))
+		handle->h_sync = 1;
 	if (insert_inode_locked(inode) < 0) {
 		err = -EINVAL;
 		goto fail_drop;
 	}
+	spin_lock(&sbi->s_next_gen_lock);
+	inode->i_generation = sbi->s_next_generation++;
+	spin_unlock(&sbi->s_next_gen_lock);
 
+	ei->i_state_flags = 0;
+	dedupfs_set_inode_state(inode, DEDUPFS_STATE_NEW);
+
+	ei->i_extra_isize =
+		(DEDUPFS_INODE_SIZE(inode->i_sb) > DEDUPFS_GOOD_OLD_INODE_SIZE) ?
+		sizeof(struct dedupfs_inode) - DEDUPFS_GOOD_OLD_INODE_SIZE : 0;
+
+	ret = inode;
 	dquot_initialize(inode);
 	err = dquot_alloc_inode(inode);
 	if (err)
 		goto fail_drop;
 
-	err = dedupfs_init_acl(inode, dir);
+	err = dedupfs_init_acl(handle, inode, dir);
 	if (err)
 		goto fail_free_drop;
 
-	err = dedupfs_init_security(inode,dir);
+	err = dedupfs_init_security(handle,inode, dir);
 	if (err)
 		goto fail_free_drop;
 
-	mark_inode_dirty(inode);
+	err = dedupfs_mark_inode_dirty(handle, inode);
+	if (err) {
+		dedupfs_std_error(sb, err);
+		goto fail_free_drop;
+	}
+
 	dedupfs_debug("allocating inode %lu\n", inode->i_ino);
-	dedupfs_preread_inode(inode);
-	return inode;
+	goto really_out;
+fail:
+	dedupfs_std_error(sb, err);
+out:
+	iput(inode);
+	ret = ERR_PTR(err);
+really_out:
+	brelse(bitmap_bh);
+	return ret;
 
 fail_free_drop:
 	dquot_free_inode(inode);
@@ -603,54 +614,128 @@ fail_drop:
 	inode->i_nlink = 0;
 	unlock_new_inode(inode);
 	iput(inode);
+	brelse(bitmap_bh);
 	return ERR_PTR(err);
+}
 
-fail:
-	make_bad_inode(inode);
-	iput(inode);
+/* Verify that we are loading a valid orphan from disk */
+struct inode *dedupfs_orphan_get(struct super_block *sb, unsigned long ino)
+{
+	unsigned long max_ino = le32_to_cpu(DEDUPFS_SB(sb)->s_es->s_inodes_count);
+	unsigned long block_group;
+	int bit;
+	struct buffer_head *bitmap_bh;
+	struct inode *inode = NULL;
+	long err = -EIO;
+
+	/* Error cases - e2fsck has already cleaned up for us */
+	if (ino > max_ino) {
+		dedupfs_warning(sb, __func__,
+			     "bad orphan ino %lu!  e2fsck was run?", ino);
+		goto error;
+	}
+
+	block_group = (ino - 1) / DEDUPFS_INODES_PER_GROUP(sb);
+	bit = (ino - 1) % DEDUPFS_INODES_PER_GROUP(sb);
+	bitmap_bh = read_inode_bitmap(sb, block_group);
+	if (!bitmap_bh) {
+		dedupfs_warning(sb, __func__,
+			     "inode bitmap error for orphan %lu", ino);
+		goto error;
+	}
+
+	/* Having the inode bit set should be a 100% indicator that this
+	 * is a valid orphan (no e2fsck run on fs).  Orphans also include
+	 * inodes that were being truncated, so we can't check i_nlink==0.
+	 */
+	if (!dedupfs_test_bit(bit, bitmap_bh->b_data))
+		goto bad_orphan;
+
+	inode = dedupfs_iget(sb, ino);
+	if (IS_ERR(inode))
+		goto iget_failed;
+
+	/*
+	 * If the orphans has i_nlinks > 0 then it should be able to be
+	 * truncated, otherwise it won't be removed from the orphan list
+	 * during processing and an infinite loop will result.
+	 */
+	if (inode->i_nlink && !dedupfs_can_truncate(inode))
+		goto bad_orphan;
+
+	if (NEXT_ORPHAN(inode) > max_ino)
+		goto bad_orphan;
+	brelse(bitmap_bh);
+	return inode;
+
+iget_failed:
+	err = PTR_ERR(inode);
+	inode = NULL;
+bad_orphan:
+	dedupfs_warning(sb, __func__,
+		     "bad orphan inode %lu!  e2fsck was run?", ino);
+	printk(KERN_NOTICE "dedupfs_test_bit(bit=%d, block=%llu) = %d\n",
+	       bit, (unsigned long long)bitmap_bh->b_blocknr,
+	       dedupfs_test_bit(bit, bitmap_bh->b_data));
+	printk(KERN_NOTICE "inode=%p\n", inode);
+	if (inode) {
+		printk(KERN_NOTICE "is_bad_inode(inode)=%d\n",
+		       is_bad_inode(inode));
+		printk(KERN_NOTICE "NEXT_ORPHAN(inode)=%u\n",
+		       NEXT_ORPHAN(inode));
+		printk(KERN_NOTICE "max_ino=%lu\n", max_ino);
+		printk(KERN_NOTICE "i_nlink=%u\n", inode->i_nlink);
+		/* Avoid freeing blocks if we got a bad deleted inode */
+		if (inode->i_nlink == 0)
+			inode->i_blocks = 0;
+		iput(inode);
+	}
+	brelse(bitmap_bh);
+error:
 	return ERR_PTR(err);
 }
 
 unsigned long dedupfs_count_free_inodes (struct super_block * sb)
 {
-	struct dedupfs_group_desc *desc;
-	unsigned long desc_count = 0;
-	int i;	
-
+	unsigned long desc_count;
+	struct dedupfs_group_desc *gdp;
+	int i;
 #ifdef DEDUPFS_DEBUG
 	struct dedupfs_super_block *es;
-	unsigned long bitmap_count = 0;
+	unsigned long bitmap_count, x;
 	struct buffer_head *bitmap_bh = NULL;
 
 	es = DEDUPFS_SB(sb)->s_es;
+	desc_count = 0;
+	bitmap_count = 0;
+	gdp = NULL;
 	for (i = 0; i < DEDUPFS_SB(sb)->s_groups_count; i++) {
-		unsigned x;
-
-		desc = dedupfs_get_group_desc (sb, i, NULL);
-		if (!desc)
+		gdp = dedupfs_get_group_desc (sb, i, NULL);
+		if (!gdp)
 			continue;
-		desc_count += le16_to_cpu(desc->bg_free_inodes_count);
+		desc_count += le16_to_cpu(gdp->bg_free_inodes_count);
 		brelse(bitmap_bh);
 		bitmap_bh = read_inode_bitmap(sb, i);
 		if (!bitmap_bh)
 			continue;
 
 		x = dedupfs_count_free(bitmap_bh, DEDUPFS_INODES_PER_GROUP(sb) / 8);
-		printk("group %d: stored = %d, counted = %u\n",
-			i, le16_to_cpu(desc->bg_free_inodes_count), x);
+		printk("group %d: stored = %d, counted = %lu\n",
+			i, le16_to_cpu(gdp->bg_free_inodes_count), x);
 		bitmap_count += x;
 	}
 	brelse(bitmap_bh);
-	printk("dedupfs_count_free_inodes: stored = %lu, computed = %lu, %lu\n",
-		percpu_counter_read(&DEDUPFS_SB(sb)->s_freeinodes_counter),
-		desc_count, bitmap_count);
+	printk("dedupfs_count_free_inodes: stored = %u, computed = %lu, %lu\n",
+		le32_to_cpu(es->s_free_inodes_count), desc_count, bitmap_count);
 	return desc_count;
 #else
+	desc_count = 0;
 	for (i = 0; i < DEDUPFS_SB(sb)->s_groups_count; i++) {
-		desc = dedupfs_get_group_desc (sb, i, NULL);
-		if (!desc)
+		gdp = dedupfs_get_group_desc (sb, i, NULL);
+		if (!gdp)
 			continue;
-		desc_count += le16_to_cpu(desc->bg_free_inodes_count);
+		desc_count += le16_to_cpu(gdp->bg_free_inodes_count);
+		cond_resched();
 	}
 	return desc_count;
 #endif

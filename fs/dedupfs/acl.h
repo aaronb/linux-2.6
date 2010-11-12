@@ -6,7 +6,7 @@
 
 #include <linux/posix_acl_xattr.h>
 
-#define EXT2_ACL_VERSION	0x0001
+#define DEDUPFS_ACL_VERSION	0x0001
 
 typedef struct {
 	__le16		e_tag;
@@ -51,28 +51,27 @@ static inline int dedupfs_acl_count(size_t size)
 	}
 }
 
-#ifdef CONFIG_EXT2_FS_POSIX_ACL
+#ifdef CONFIG_DEDUPFS_POSIX_ACL
 
 /* acl.c */
 extern int dedupfs_check_acl (struct inode *, int);
 extern int dedupfs_acl_chmod (struct inode *);
-extern int dedupfs_init_acl (struct inode *, struct inode *);
+extern int dedupfs_init_acl (handle_t *, struct inode *, struct inode *);
 
-#else
+#else  /* CONFIG_DEDUPFS_POSIX_ACL */
 #include <linux/sched.h>
-#define dedupfs_check_acl	NULL
-#define dedupfs_get_acl	NULL
-#define dedupfs_set_acl	NULL
+#define dedupfs_check_acl NULL
 
 static inline int
-dedupfs_acl_chmod (struct inode *inode)
+dedupfs_acl_chmod(struct inode *inode)
 {
 	return 0;
 }
 
-static inline int dedupfs_init_acl (struct inode *inode, struct inode *dir)
+static inline int
+dedupfs_init_acl(handle_t *handle, struct inode *inode, struct inode *dir)
 {
 	return 0;
 }
-#endif
+#endif  /* CONFIG_DEDUPFS_POSIX_ACL */
 

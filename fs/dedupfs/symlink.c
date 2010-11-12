@@ -17,14 +17,16 @@
  *  dedupfs symlink handling code
  */
 
+#include <linux/fs.h>
+#include <linux/jbd.h>
 #include "dedupfs.h"
-#include "xattr.h"
 #include <linux/namei.h>
+#include "xattr.h"
 
-static void *dedupfs_follow_link(struct dentry *dentry, struct nameidata *nd)
+static void * dedupfs_follow_link(struct dentry *dentry, struct nameidata *nd)
 {
 	struct dedupfs_inode_info *ei = DEDUPFS_I(dentry->d_inode);
-	nd_set_link(nd, (char *)ei->i_data);
+	nd_set_link(nd, (char*)ei->i_data);
 	return NULL;
 }
 
@@ -40,7 +42,7 @@ const struct inode_operations dedupfs_symlink_inode_operations = {
 	.removexattr	= generic_removexattr,
 #endif
 };
- 
+
 const struct inode_operations dedupfs_fast_symlink_inode_operations = {
 	.readlink	= generic_readlink,
 	.follow_link	= dedupfs_follow_link,

@@ -1,5 +1,5 @@
 /*
- *  linux/include/linux/dedupfs_fs_sb.h
+ *  linux/include/linux/dedupfs_sb.h
  *
  * Copyright (C) 1992, 1993, 1994, 1995
  * Remy Card (card@masi.ibp.fr)
@@ -16,57 +16,16 @@
 #ifndef _LINUX_DEDUPFS_SB
 #define _LINUX_DEDUPFS_SB
 
+#ifdef __KERNEL__
+#include <linux/timer.h>
+#include <linux/wait.h>
 #include <linux/blockgroup_lock.h>
 #include <linux/percpu_counter.h>
+#endif
 #include <linux/rbtree.h>
 
-/* XXX Here for now... not interested in restructing headers JUST now */
-
-/* data type for block offset of block group */
-typedef int dedupfs_grpblk_t;
-
-/* data type for filesystem-wide blocks number */
-typedef unsigned long dedupfs_fsblk_t;
-
-#define E2FSBLK "%lu"
-
-struct dedupfs_reserve_window {
-	dedupfs_fsblk_t		_rsv_start;	/* First byte reserved */
-	dedupfs_fsblk_t		_rsv_end;	/* Last byte reserved or 0 */
-};
-
-struct dedupfs_reserve_window_node {
-	struct rb_node	 	rsv_node;
-	__u32			rsv_goal_size;
-	__u32			rsv_alloc_hit;
-	struct dedupfs_reserve_window	rsv_window;
-};
-
-struct dedupfs_block_alloc_info {
-	/* information about reservation window */
-	struct dedupfs_reserve_window_node	rsv_window_node;
-	/*
-	 * was i_next_alloc_block in dedupfs_inode_info
-	 * is the logical (file-relative) number of the
-	 * most-recently-allocated block in this file.
-	 * We use this for detecting linearly ascending allocation requests.
-	 */
-	__u32			last_alloc_logical_block;
-	/*
-	 * Was i_next_alloc_goal in dedupfs_inode_info
-	 * is the *physical* companion to i_next_alloc_block.
-	 * it the the physical block number of the block which was most-recentl
-	 * allocated to this file.  This give us the goal (target) for the next
-	 * allocation when we detect linearly ascending requests.
-	 */
-	dedupfs_fsblk_t		last_alloc_physical_block;
-};
-
-#define rsv_start rsv_window._rsv_start
-#define rsv_end rsv_window._rsv_end
-
 /*
- * second extended-fs super-block data in memory
+ * third extended-fs super-block data in memory
  */
 struct dedupfs_sb_info {
 	unsigned long s_frag_size;	/* Size of a fragment in bytes */
@@ -85,7 +44,7 @@ struct dedupfs_sb_info {
 	struct dedupfs_super_block * s_es;	/* Pointer to the super block in the buffer */
 	struct buffer_head ** s_group_desc;
 	unsigned long  s_mount_opt;
-	unsigned long s_sb_block;
+	dedupfsblk_t s_sb_block;
 	uid_t s_resuid;
 	gid_t s_resgid;
 	unsigned short s_mount_state;
@@ -96,25 +55,35 @@ struct dedupfs_sb_info {
 	int s_first_ino;
 	spinlock_t s_next_gen_lock;
 	u32 s_next_generation;
-	unsigned long s_dir_count;
-	u8 *s_debts;
+	u32 s_hash_seed[4];
+	int s_def_hash_version;
+	int s_hash_unsigned;	/* 3 if hash should be signed, 0 if not */
 	struct percpu_counter s_freeblocks_counter;
 	struct percpu_counter s_freeinodes_counter;
 	struct percpu_counter s_dirs_counter;
 	struct blockgroup_lock *s_blockgroup_lock;
+
 	/* root of the per fs reservation window tree */
 	spinlock_t s_rsv_window_lock;
 	struct rb_root s_rsv_window_root;
 	struct dedupfs_reserve_window_node s_rsv_window_head;
-	/*
-	 * s_lock protects against concurrent modifications of s_mount_state,
-	 * s_blocks_last, s_overhead_last and the content of superblock's
-	 * buffer pointed to by sbi->s_es.
-	 *
-	 * Note: It is used in dedupfs_show_options() to provide a consistent view
-	 * of the mount options.
-	 */
-	spinlock_t s_lock;
+
+	/* Journaling */
+	struct inode * s_journal_inode;
+	struct journal_s * s_journal;
+	struct list_head s_orphan;
+	struct mutex s_orphan_lock;
+	struct mutex s_resize_lock;
+	unsigned long s_commit_interval;
+	struct block_device *journal_bdev;
+#ifdef CONFIG_JBD_DEBUG
+	struct timer_list turn_ro_timer;	/* For turning read-only (crash simulation) */
+	wait_queue_head_t ro_wait_queue;	/* For people waiting for the fs to go read-only */
+#endif
+#ifdef CONFIG_QUOTA
+	char *s_qf_names[MAXQUOTAS];		/* Names of quota files with journalled quota */
+	int s_jquota_fmt;			/* Format of quota to use */
+#endif
 };
 
 static inline spinlock_t *

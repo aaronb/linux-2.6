@@ -5,9 +5,10 @@
  * Copyright (C) 2001 by Andreas Gruenbacher, <a.gruenbacher@computer.org>
  */
 
-#include <linux/init.h>
 #include <linux/module.h>
 #include <linux/string.h>
+#include <linux/fs.h>
+#include "dedupfs_jbd.h"
 #include "dedupfs.h"
 #include "xattr.h"
 
@@ -30,14 +31,14 @@ dedupfs_xattr_user_list(struct dentry *dentry, char *list, size_t list_size,
 }
 
 static int
-dedupfs_xattr_user_get(struct dentry *dentry, const char *name,
-		void *buffer, size_t size, int type)
+dedupfs_xattr_user_get(struct dentry *dentry, const char *name, void *buffer,
+		size_t size, int type)
 {
 	if (strcmp(name, "") == 0)
 		return -EINVAL;
 	if (!test_opt(dentry->d_sb, XATTR_USER))
 		return -EOPNOTSUPP;
-	return dedupfs_xattr_get(dentry->d_inode, EXT2_XATTR_INDEX_USER,
+	return dedupfs_xattr_get(dentry->d_inode, DEDUPFS_XATTR_INDEX_USER,
 			      name, buffer, size);
 }
 
@@ -49,8 +50,7 @@ dedupfs_xattr_user_set(struct dentry *dentry, const char *name,
 		return -EINVAL;
 	if (!test_opt(dentry->d_sb, XATTR_USER))
 		return -EOPNOTSUPP;
-
-	return dedupfs_xattr_set(dentry->d_inode, EXT2_XATTR_INDEX_USER,
+	return dedupfs_xattr_set(dentry->d_inode, DEDUPFS_XATTR_INDEX_USER,
 			      name, value, size, flags);
 }
 

@@ -19,58 +19,126 @@
 #include <linux/module.h>
 #include <linux/string.h>
 #include <linux/fs.h>
+#include <linux/time.h>
+#include <linux/jbd.h>
+#include "dedupfs.h"
+#include "dedupfs_jbd.h"
 #include <linux/slab.h>
 #include <linux/init.h>
 #include <linux/blkdev.h>
 #include <linux/parser.h>
-#include <linux/random.h>
+#include <linux/smp_lock.h>
 #include <linux/buffer_head.h>
 #include <linux/exportfs.h>
 #include <linux/vfs.h>
-#include <linux/seq_file.h>
+#include <linux/random.h>
 #include <linux/mount.h>
-#include <linux/log2.h>
+#include <linux/namei.h>
 #include <linux/quotaops.h>
+#include <linux/seq_file.h>
+#include <linux/log2.h>
+
 #include <asm/uaccess.h>
-#include "dedupfs.h"
+
 #include "xattr.h"
 #include "acl.h"
-#include "xip.h"
+#include "namei.h"
 
-static void dedupfs_sync_super(struct super_block *sb,
-			    struct dedupfs_super_block *es, int wait);
+#ifdef CONFIG_DEDUPFS_DEFAULTS_TO_ORDERED
+  #define DEDUPFS_MOUNT_DEFAULT_DATA_MODE DEDUPFS_MOUNT_ORDERED_DATA
+#else
+  #define DEDUPFS_MOUNT_DEFAULT_DATA_MODE DEDUPFS_MOUNT_WRITEBACK_DATA
+#endif
+
+static int dedupfs_load_journal(struct super_block *, struct dedupfs_super_block *,
+			     unsigned long journal_devnum);
+static int dedupfs_create_journal(struct super_block *, struct dedupfs_super_block *,
+			       unsigned int);
+static int dedupfs_commit_super(struct super_block *sb,
+			       struct dedupfs_super_block *es,
+			       int sync);
+static void dedupfs_mark_recovery_complete(struct super_block * sb,
+					struct dedupfs_super_block * es);
+static void dedupfs_clear_journal_err(struct super_block * sb,
+				   struct dedupfs_super_block * es);
+static int dedupfs_sync_fs(struct super_block *sb, int wait);
+static const char *dedupfs_decode_error(struct super_block * sb, int errno,
+				     char nbuf[16]);
 static int dedupfs_remount (struct super_block * sb, int * flags, char * data);
 static int dedupfs_statfs (struct dentry * dentry, struct kstatfs * buf);
-static int dedupfs_sync_fs(struct super_block *sb, int wait);
+static int dedupfs_unfreeze(struct super_block *sb);
+static int dedupfs_freeze(struct super_block *sb);
 
-void dedupfs_error (struct super_block * sb, const char * function,
-		 const char * fmt, ...)
+/*
+ * Wrappers for journal_start/end.
+ *
+ * The only special thing we need to do here is to make sure that all
+ * journal_end calls result in the superblock being marked dirty, so
+ * that sync() will call the filesystem's write_super callback if
+ * appropriate.
+ */
+handle_t *dedupfs_journal_start_sb(struct super_block *sb, int nblocks)
 {
-	va_list args;
-	struct dedupfs_sb_info *sbi = DEDUPFS_SB(sb);
-	struct dedupfs_super_block *es = sbi->s_es;
+	journal_t *journal;
 
-	if (!(sb->s_flags & MS_RDONLY)) {
-		spin_lock(&sbi->s_lock);
-		sbi->s_mount_state |= DEDUPFS_ERROR_FS;
-		es->s_state |= cpu_to_le16(DEDUPFS_ERROR_FS);
-		spin_unlock(&sbi->s_lock);
-		dedupfs_sync_super(sb, es, 1);
+	if (sb->s_flags & MS_RDONLY)
+		return ERR_PTR(-EROFS);
+
+	/* Special case here: if the journal has aborted behind our
+	 * backs (eg. EIO in the commit thread), then we still need to
+	 * take the FS itself readonly cleanly. */
+	journal = DEDUPFS_SB(sb)->s_journal;
+	if (is_journal_aborted(journal)) {
+		dedupfs_abort(sb, __func__,
+			   "Detected aborted journal");
+		return ERR_PTR(-EROFS);
 	}
 
-	va_start(args, fmt);
-	printk(KERN_CRIT "DEDUPFS-fs (%s): error: %s: ", sb->s_id, function);
-	vprintk(fmt, args);
-	printk("\n");
-	va_end(args);
+	return journal_start(journal, nblocks);
+}
 
-	if (test_opt(sb, ERRORS_PANIC))
-		panic("DEDUPFS-fs: panic from previous error\n");
-	if (test_opt(sb, ERRORS_RO)) {
-		dedupfs_msg(sb, KERN_CRIT,
-			     "error: remounting filesystem read-only");
-		sb->s_flags |= MS_RDONLY;
-	}
+/*
+ * The only special thing we need to do here is to make sure that all
+ * journal_stop calls result in the superblock being marked dirty, so
+ * that sync() will call the filesystem's write_super callback if
+ * appropriate.
+ */
+int __dedupfs_journal_stop(const char *where, handle_t *handle)
+{
+	struct super_block *sb;
+	int err;
+	int rc;
+
+	sb = handle->h_transaction->t_journal->j_private;
+	err = handle->h_err;
+	rc = journal_stop(handle);
+
+	if (!err)
+		err = rc;
+	if (err)
+		__dedupfs_std_error(sb, where, err);
+	return err;
+}
+
+void dedupfs_journal_abort_handle(const char *caller, const char *err_fn,
+		struct buffer_head *bh, handle_t *handle, int err)
+{
+	char nbuf[16];
+	const char *errstr = dedupfs_decode_error(NULL, err, nbuf);
+
+	if (bh)
+		BUFFER_TRACE(bh, "abort");
+
+	if (!handle->h_err)
+		handle->h_err = err;
+
+	if (is_handle_aborted(handle))
+		return;
+
+	printk(KERN_ERR "DEDUPFS-fs: %s: aborting transaction: %s in %s\n",
+		caller, errstr, err_fn);
+
+	journal_abort_handle(handle);
 }
 
 void dedupfs_msg(struct super_block *sb, const char *prefix,
@@ -85,9 +153,167 @@ void dedupfs_msg(struct super_block *sb, const char *prefix,
 	va_end(args);
 }
 
-/*
- * This must be called with sbi->s_lock held.
+/* Deal with the reporting of failure conditions on a filesystem such as
+ * inconsistencies detected or read IO failures.
+ *
+ * On ext2, we can store the error state of the filesystem in the
+ * superblock.  That is not possible on dedupfs, because we may have other
+ * write ordering constraints on the superblock which prevent us from
+ * writing it out straight away; and given that the journal is about to
+ * be aborted, we can't rely on the current, or future, transactions to
+ * write out the superblock safely.
+ *
+ * We'll just use the journal_abort() error code to record an error in
+ * the journal instead.  On recovery, the journal will complain about
+ * that error until we've noted it down and cleared it.
  */
+
+static void dedupfs_handle_error(struct super_block *sb)
+{
+	struct dedupfs_super_block *es = DEDUPFS_SB(sb)->s_es;
+
+	DEDUPFS_SB(sb)->s_mount_state |= DEDUPFS_ERROR_FS;
+	es->s_state |= cpu_to_le16(DEDUPFS_ERROR_FS);
+
+	if (sb->s_flags & MS_RDONLY)
+		return;
+
+	if (!test_opt (sb, ERRORS_CONT)) {
+		journal_t *journal = DEDUPFS_SB(sb)->s_journal;
+
+		set_opt(DEDUPFS_SB(sb)->s_mount_opt, ABORT);
+		if (journal)
+			journal_abort(journal, -EIO);
+	}
+	if (test_opt (sb, ERRORS_RO)) {
+		dedupfs_msg(sb, KERN_CRIT,
+			"error: remounting filesystem read-only");
+		sb->s_flags |= MS_RDONLY;
+	}
+	dedupfs_commit_super(sb, es, 1);
+	if (test_opt(sb, ERRORS_PANIC))
+		panic("DEDUPFS-fs (%s): panic forced after error\n",
+			sb->s_id);
+}
+
+void dedupfs_error (struct super_block * sb, const char * function,
+		 const char * fmt, ...)
+{
+	va_list args;
+
+	va_start(args, fmt);
+	printk(KERN_CRIT "DEDUPFS-fs error (device %s): %s: ",sb->s_id, function);
+	vprintk(fmt, args);
+	printk("\n");
+	va_end(args);
+
+	dedupfs_handle_error(sb);
+}
+
+static const char *dedupfs_decode_error(struct super_block * sb, int errno,
+				     char nbuf[16])
+{
+	char *errstr = NULL;
+
+	switch (errno) {
+	case -EIO:
+		errstr = "IO failure";
+		break;
+	case -ENOMEM:
+		errstr = "Out of memory";
+		break;
+	case -EROFS:
+		if (!sb || DEDUPFS_SB(sb)->s_journal->j_flags & JFS_ABORT)
+			errstr = "Journal has aborted";
+		else
+			errstr = "Readonly filesystem";
+		break;
+	default:
+		/* If the caller passed in an extra buffer for unknown
+		 * errors, textualise them now.  Else we just return
+		 * NULL. */
+		if (nbuf) {
+			/* Check for truncated error codes... */
+			if (snprintf(nbuf, 16, "error %d", -errno) >= 0)
+				errstr = nbuf;
+		}
+		break;
+	}
+
+	return errstr;
+}
+
+/* __dedupfs_std_error decodes expected errors from journaling functions
+ * automatically and invokes the appropriate error response.  */
+
+void __dedupfs_std_error (struct super_block * sb, const char * function,
+		       int errno)
+{
+	char nbuf[16];
+	const char *errstr;
+
+	/* Special case: if the error is EROFS, and we're not already
+	 * inside a transaction, then there's really no point in logging
+	 * an error. */
+	if (errno == -EROFS && journal_current_handle() == NULL &&
+	    (sb->s_flags & MS_RDONLY))
+		return;
+
+	errstr = dedupfs_decode_error(sb, errno, nbuf);
+	dedupfs_msg(sb, KERN_CRIT, "error in %s: %s", function, errstr);
+
+	dedupfs_handle_error(sb);
+}
+
+/*
+ * dedupfs_abort is a much stronger failure handler than dedupfs_error.  The
+ * abort function may be used to deal with unrecoverable failures such
+ * as journal IO errors or ENOMEM at a critical moment in log management.
+ *
+ * We unconditionally force the filesystem into an ABORT|READONLY state,
+ * unless the error response on the fs has been set to panic in which
+ * case we take the easy way out and panic immediately.
+ */
+
+void dedupfs_abort (struct super_block * sb, const char * function,
+		 const char * fmt, ...)
+{
+	va_list args;
+
+	va_start(args, fmt);
+	printk(KERN_CRIT "DEDUPFS-fs (%s): error: %s: ", sb->s_id, function);
+	vprintk(fmt, args);
+	printk("\n");
+	va_end(args);
+
+	if (test_opt(sb, ERRORS_PANIC))
+		panic("DEDUPFS-fs: panic from previous error\n");
+
+	if (sb->s_flags & MS_RDONLY)
+		return;
+
+	dedupfs_msg(sb, KERN_CRIT,
+		"error: remounting filesystem read-only");
+	DEDUPFS_SB(sb)->s_mount_state |= DEDUPFS_ERROR_FS;
+	sb->s_flags |= MS_RDONLY;
+	set_opt(DEDUPFS_SB(sb)->s_mount_opt, ABORT);
+	if (DEDUPFS_SB(sb)->s_journal)
+		journal_abort(DEDUPFS_SB(sb)->s_journal, -EIO);
+}
+
+void dedupfs_warning (struct super_block * sb, const char * function,
+		   const char * fmt, ...)
+{
+	va_list args;
+
+	va_start(args, fmt);
+	printk(KERN_WARNING "DEDUPFS-fs (%s): warning: %s: ",
+	       sb->s_id, function);
+	vprintk(fmt, args);
+	printk("\n");
+	va_end(args);
+}
+
 void dedupfs_update_dynamic_rev(struct super_block *sb)
 {
 	struct dedupfs_super_block *es = DEDUPFS_SB(sb)->s_es;
@@ -96,9 +322,9 @@ void dedupfs_update_dynamic_rev(struct super_block *sb)
 		return;
 
 	dedupfs_msg(sb, KERN_WARNING,
-		     "warning: updating to rev %d because of "
-		     "new feature flag, running e2fsck is recommended",
-		     DEDUPFS_DYNAMIC_REV);
+		"warning: updating to rev %d because of "
+		"new feature flag, running e2fsck is recommended",
+		DEDUPFS_DYNAMIC_REV);
 
 	es->s_first_ino = cpu_to_le32(DEDUPFS_GOOD_OLD_FIRST_INO);
 	es->s_inode_size = cpu_to_le16(DEDUPFS_GOOD_OLD_INODE_SIZE);
@@ -113,56 +339,162 @@ void dedupfs_update_dynamic_rev(struct super_block *sb)
 	 */
 }
 
+/*
+ * Open the external journal device
+ */
+static struct block_device *dedupfs_blkdev_get(dev_t dev, struct super_block *sb)
+{
+	struct block_device *bdev;
+	char b[BDEVNAME_SIZE];
+
+	bdev = open_by_devnum(dev, FMODE_READ|FMODE_WRITE);
+	if (IS_ERR(bdev))
+		goto fail;
+	return bdev;
+
+fail:
+	dedupfs_msg(sb, "error: failed to open journal device %s: %ld",
+		__bdevname(dev, b), PTR_ERR(bdev));
+
+	return NULL;
+}
+
+/*
+ * Release the journal device
+ */
+static int dedupfs_blkdev_put(struct block_device *bdev)
+{
+	bd_release(bdev);
+	return blkdev_put(bdev, FMODE_READ|FMODE_WRITE);
+}
+
+static int dedupfs_blkdev_remove(struct dedupfs_sb_info *sbi)
+{
+	struct block_device *bdev;
+	int ret = -ENODEV;
+
+	bdev = sbi->journal_bdev;
+	if (bdev) {
+		ret = dedupfs_blkdev_put(bdev);
+		sbi->journal_bdev = NULL;
+	}
+	return ret;
+}
+
+static inline struct inode *orphan_list_entry(struct list_head *l)
+{
+	return &list_entry(l, struct dedupfs_inode_info, i_orphan)->vfs_inode;
+}
+
+static void dump_orphan_list(struct super_block *sb, struct dedupfs_sb_info *sbi)
+{
+	struct list_head *l;
+
+	dedupfs_msg(sb, KERN_ERR, "error: sb orphan head is %d",
+	       le32_to_cpu(sbi->s_es->s_last_orphan));
+
+	dedupfs_msg(sb, KERN_ERR, "sb_info orphan list:");
+	list_for_each(l, &sbi->s_orphan) {
+		struct inode *inode = orphan_list_entry(l);
+		dedupfs_msg(sb, KERN_ERR, "  "
+		       "inode %s:%lu at %p: mode %o, nlink %d, next %d\n",
+		       inode->i_sb->s_id, inode->i_ino, inode,
+		       inode->i_mode, inode->i_nlink,
+		       NEXT_ORPHAN(inode));
+	}
+}
+
 static void dedupfs_put_super (struct super_block * sb)
 {
-	int db_count;
-	int i;
 	struct dedupfs_sb_info *sbi = DEDUPFS_SB(sb);
+	struct dedupfs_super_block *es = sbi->s_es;
+	int i, err;
 
 	dquot_disable(sb, -1, DQUOT_USAGE_ENABLED | DQUOT_LIMITS_ENABLED);
 
-	if (sb->s_dirt)
-		dedupfs_write_super(sb);
+	lock_kernel();
 
 	dedupfs_xattr_put_super(sb);
-	if (!(sb->s_flags & MS_RDONLY)) {
-		struct dedupfs_super_block *es = sbi->s_es;
+	err = journal_destroy(sbi->s_journal);
+	sbi->s_journal = NULL;
+	if (err < 0)
+		dedupfs_abort(sb, __func__, "Couldn't clean up the journal");
 
-		spin_lock(&sbi->s_lock);
+	if (!(sb->s_flags & MS_RDONLY)) {
+		DEDUPFS_CLEAR_INCOMPAT_FEATURE(sb, DEDUPFS_FEATURE_INCOMPAT_RECOVER);
 		es->s_state = cpu_to_le16(sbi->s_mount_state);
-		spin_unlock(&sbi->s_lock);
-		dedupfs_sync_super(sb, es, 1);
+		BUFFER_TRACE(sbi->s_sbh, "marking dirty");
+		mark_buffer_dirty(sbi->s_sbh);
+		dedupfs_commit_super(sb, es, 1);
 	}
-	db_count = sbi->s_gdb_count;
-	for (i = 0; i < db_count; i++)
-		if (sbi->s_group_desc[i])
-			brelse (sbi->s_group_desc[i]);
+
+	for (i = 0; i < sbi->s_gdb_count; i++)
+		brelse(sbi->s_group_desc[i]);
 	kfree(sbi->s_group_desc);
-	kfree(sbi->s_debts);
 	percpu_counter_destroy(&sbi->s_freeblocks_counter);
 	percpu_counter_destroy(&sbi->s_freeinodes_counter);
 	percpu_counter_destroy(&sbi->s_dirs_counter);
-	brelse (sbi->s_sbh);
+	brelse(sbi->s_sbh);
+#ifdef CONFIG_QUOTA
+	for (i = 0; i < MAXQUOTAS; i++)
+		kfree(sbi->s_qf_names[i]);
+#endif
+
+	/* Debugging code just in case the in-memory inode orphan list
+	 * isn't empty.  The on-disk one can be non-empty if we've
+	 * detected an error and taken the fs readonly, but the
+	 * in-memory list had better be clean by this point. */
+	if (!list_empty(&sbi->s_orphan))
+		dump_orphan_list(sb, sbi);
+	J_ASSERT(list_empty(&sbi->s_orphan));
+
+	invalidate_bdev(sb->s_bdev);
+	if (sbi->journal_bdev && sbi->journal_bdev != sb->s_bdev) {
+		/*
+		 * Invalidate the journal device's buffers.  We don't want them
+		 * floating about in memory - the physical journal device may
+		 * hotswapped, and it breaks the `ro-after' testing code.
+		 */
+		sync_blockdev(sbi->journal_bdev);
+		invalidate_bdev(sbi->journal_bdev);
+		dedupfs_blkdev_remove(sbi);
+	}
 	sb->s_fs_info = NULL;
 	kfree(sbi->s_blockgroup_lock);
 	kfree(sbi);
+
+	unlock_kernel();
 }
 
-static struct kmem_cache * dedupfs_inode_cachep;
+static struct kmem_cache *dedupfs_inode_cachep;
 
+/*
+ * Called inside transaction, so use GFP_NOFS
+ */
 static struct inode *dedupfs_alloc_inode(struct super_block *sb)
 {
 	struct dedupfs_inode_info *ei;
-	ei = (struct dedupfs_inode_info *)kmem_cache_alloc(dedupfs_inode_cachep, GFP_KERNEL);
+
+	ei = kmem_cache_alloc(dedupfs_inode_cachep, GFP_NOFS);
 	if (!ei)
 		return NULL;
 	ei->i_block_alloc_info = NULL;
 	ei->vfs_inode.i_version = 1;
+	atomic_set(&ei->i_datasync_tid, 0);
+	atomic_set(&ei->i_sync_tid, 0);
 	return &ei->vfs_inode;
 }
 
 static void dedupfs_destroy_inode(struct inode *inode)
 {
+	if (!list_empty(&(DEDUPFS_I(inode)->i_orphan))) {
+		printk("DEDUPFS Inode %p: orphan list check failed!\n",
+			DEDUPFS_I(inode));
+		print_hex_dump(KERN_INFO, "", DUMP_PREFIX_ADDRESS, 16, 4,
+				DEDUPFS_I(inode), sizeof(struct dedupfs_inode_info),
+				false);
+		dump_stack();
+	}
 	kmem_cache_free(dedupfs_inode_cachep, DEDUPFS_I(inode));
 }
 
@@ -170,7 +502,7 @@ static void init_once(void *foo)
 {
 	struct dedupfs_inode_info *ei = (struct dedupfs_inode_info *) foo;
 
-	rwlock_init(&ei->i_meta_lock);
+	INIT_LIST_HEAD(&ei->i_orphan);
 #ifdef CONFIG_DEDUPFS_XATTR
 	init_rwsem(&ei->xattr_sem);
 #endif
@@ -195,6 +527,60 @@ static void destroy_inodecache(void)
 	kmem_cache_destroy(dedupfs_inode_cachep);
 }
 
+static inline void dedupfs_show_quota_options(struct seq_file *seq, struct super_block *sb)
+{
+#if defined(CONFIG_QUOTA)
+	struct dedupfs_sb_info *sbi = DEDUPFS_SB(sb);
+
+	if (sbi->s_jquota_fmt) {
+		char *fmtname = "";
+
+		switch (sbi->s_jquota_fmt) {
+		case QFMT_VFS_OLD:
+			fmtname = "vfsold";
+			break;
+		case QFMT_VFS_V0:
+			fmtname = "vfsv0";
+			break;
+		case QFMT_VFS_V1:
+			fmtname = "vfsv1";
+			break;
+		}
+		seq_printf(seq, ",jqfmt=%s", fmtname);
+	}
+
+	if (sbi->s_qf_names[USRQUOTA])
+		seq_printf(seq, ",usrjquota=%s", sbi->s_qf_names[USRQUOTA]);
+
+	if (sbi->s_qf_names[GRPQUOTA])
+		seq_printf(seq, ",grpjquota=%s", sbi->s_qf_names[GRPQUOTA]);
+
+	if (test_opt(sb, USRQUOTA))
+		seq_puts(seq, ",usrquota");
+
+	if (test_opt(sb, GRPQUOTA))
+		seq_puts(seq, ",grpquota");
+#endif
+}
+
+static char *data_mode_string(unsigned long mode)
+{
+	switch (mode) {
+	case DEDUPFS_MOUNT_JOURNAL_DATA:
+		return "journal";
+	case DEDUPFS_MOUNT_ORDERED_DATA:
+		return "ordered";
+	case DEDUPFS_MOUNT_WRITEBACK_DATA:
+		return "writeback";
+	}
+	return "unknown";
+}
+
+/*
+ * Show an option if
+ *  - it's set to a non-default value OR
+ *  - if the per-sb default is different from the global default
+ */
 static int dedupfs_show_options(struct seq_file *seq, struct vfsmount *vfs)
 {
 	struct super_block *sb = vfs->mnt_sb;
@@ -202,7 +588,6 @@ static int dedupfs_show_options(struct seq_file *seq, struct vfsmount *vfs)
 	struct dedupfs_super_block *es = sbi->s_es;
 	unsigned long def_mount_opts;
 
-	spin_lock(&sbi->s_lock);
 	def_mount_opts = le32_to_cpu(es->s_default_mount_opts);
 
 	if (sbi->s_sb_block != 1)
@@ -239,7 +624,6 @@ static int dedupfs_show_options(struct seq_file *seq, struct vfsmount *vfs)
 		seq_puts(seq, ",debug");
 	if (test_opt(sb, OLDALLOC))
 		seq_puts(seq, ",oldalloc");
-
 #ifdef CONFIG_DEDUPFS_XATTR
 	if (test_opt(sb, XATTR_USER))
 		seq_puts(seq, ",user_xattr");
@@ -248,58 +632,36 @@ static int dedupfs_show_options(struct seq_file *seq, struct vfsmount *vfs)
 		seq_puts(seq, ",nouser_xattr");
 	}
 #endif
-
 #ifdef CONFIG_DEDUPFS_POSIX_ACL
 	if (test_opt(sb, POSIX_ACL))
 		seq_puts(seq, ",acl");
 	if (!test_opt(sb, POSIX_ACL) && (def_mount_opts & DEDUPFS_DEFM_ACL))
 		seq_puts(seq, ",noacl");
 #endif
-
-	if (test_opt(sb, NOBH))
-		seq_puts(seq, ",nobh");
-
-#if defined(CONFIG_QUOTA)
-	if (sbi->s_mount_opt & DEDUPFS_MOUNT_USRQUOTA)
-		seq_puts(seq, ",usrquota");
-
-	if (sbi->s_mount_opt & DEDUPFS_MOUNT_GRPQUOTA)
-		seq_puts(seq, ",grpquota");
-#endif
-
-#if defined(CONFIG_DEDUPFS_XIP)
-	if (sbi->s_mount_opt & DEDUPFS_MOUNT_XIP)
-		seq_puts(seq, ",xip");
-#endif
-
 	if (!test_opt(sb, RESERVATION))
 		seq_puts(seq, ",noreservation");
+	if (sbi->s_commit_interval) {
+		seq_printf(seq, ",commit=%u",
+			   (unsigned) (sbi->s_commit_interval / HZ));
+	}
 
-	spin_unlock(&sbi->s_lock);
+	/*
+	 * Always display barrier state so it's clear what the status is.
+	 */
+	seq_puts(seq, ",barrier=");
+	seq_puts(seq, test_opt(sb, BARRIER) ? "1" : "0");
+	seq_printf(seq, ",data=%s", data_mode_string(test_opt(sb, DATA_FLAGS)));
+	if (test_opt(sb, DATA_ERR_ABORT))
+		seq_puts(seq, ",data_err=abort");
+
+	if (test_opt(sb, NOLOAD))
+		seq_puts(seq, ",norecovery");
+
+	dedupfs_show_quota_options(seq, sb);
+
 	return 0;
 }
 
-#ifdef CONFIG_QUOTA
-static ssize_t dedupfs_quota_read(struct super_block *sb, int type, char *data, size_t len, loff_t off);
-static ssize_t dedupfs_quota_write(struct super_block *sb, int type, const char *data, size_t len, loff_t off);
-#endif
-
-static const struct super_operations dedupfs_sops = {
-	.alloc_inode	= dedupfs_alloc_inode,
-	.destroy_inode	= dedupfs_destroy_inode,
-	.write_inode	= dedupfs_write_inode,
-	.evict_inode	= dedupfs_evict_inode,
-	.put_super	= dedupfs_put_super,
-	.write_super	= dedupfs_write_super,
-	.sync_fs	= dedupfs_sync_fs,
-	.statfs		= dedupfs_statfs,
-	.remount_fs	= dedupfs_remount,
-	.show_options	= dedupfs_show_options,
-#ifdef CONFIG_QUOTA
-	.quota_read	= dedupfs_quota_read,
-	.quota_write	= dedupfs_quota_write,
-#endif
-};
 
 static struct inode *dedupfs_nfs_get_inode(struct super_block *sb,
 		u64 ino, u32 generation)
@@ -312,18 +674,21 @@ static struct inode *dedupfs_nfs_get_inode(struct super_block *sb,
 		return ERR_PTR(-ESTALE);
 
 	/* iget isn't really right if the inode is currently unallocated!!
-	 * dedupfs_read_inode currently does appropriate checks, but
-	 * it might be "neater" to call dedupfs_get_inode first and check
-	 * if the inode is valid.....
+	 *
+	 * dedupfs_read_inode will return a bad_inode if the inode had been
+	 * deleted, so we should be safe.
+	 *
+	 * Currently we don't know the generation for parent directory, so
+	 * a generation of 0 means "accept any"
 	 */
 	inode = dedupfs_iget(sb, ino);
 	if (IS_ERR(inode))
 		return ERR_CAST(inode);
 	if (generation && inode->i_generation != generation) {
-		/* we didn't find the right inode.. */
 		iput(inode);
 		return ERR_PTR(-ESTALE);
 	}
+
 	return inode;
 }
 
@@ -341,44 +706,103 @@ static struct dentry *dedupfs_fh_to_parent(struct super_block *sb, struct fid *f
 				    dedupfs_nfs_get_inode);
 }
 
-/* Yes, most of these are left as NULL!!
- * A NULL value implies the default, which works with dedupfs-like file
- * systems, but can be improved upon.
- * Currently only get_parent is required.
+/*
+ * Try to release metadata pages (indirect blocks, directories) which are
+ * mapped via the block device.  Since these pages could have journal heads
+ * which would prevent try_to_free_buffers() from freeing them, we must use
+ * jbd layer's try_to_free_buffers() function to release them.
  */
+static int bdev_try_to_free_page(struct super_block *sb, struct page *page,
+				 gfp_t wait)
+{
+	journal_t *journal = DEDUPFS_SB(sb)->s_journal;
+
+	WARN_ON(PageChecked(page));
+	if (!page_has_buffers(page))
+		return 0;
+	if (journal)
+		return journal_try_to_free_buffers(journal, page, 
+						   wait & ~__GFP_WAIT);
+	return try_to_free_buffers(page);
+}
+
+#ifdef CONFIG_QUOTA
+#define QTYPE2NAME(t) ((t)==USRQUOTA?"user":"group")
+#define QTYPE2MOPT(on, t) ((t)==USRQUOTA?((on)##USRJQUOTA):((on)##GRPJQUOTA))
+
+static int dedupfs_write_dquot(struct dquot *dquot);
+static int dedupfs_acquire_dquot(struct dquot *dquot);
+static int dedupfs_release_dquot(struct dquot *dquot);
+static int dedupfs_mark_dquot_dirty(struct dquot *dquot);
+static int dedupfs_write_info(struct super_block *sb, int type);
+static int dedupfs_quota_on(struct super_block *sb, int type, int format_id,
+				char *path);
+static int dedupfs_quota_on_mount(struct super_block *sb, int type);
+static ssize_t dedupfs_quota_read(struct super_block *sb, int type, char *data,
+			       size_t len, loff_t off);
+static ssize_t dedupfs_quota_write(struct super_block *sb, int type,
+				const char *data, size_t len, loff_t off);
+
+static const struct dquot_operations dedupfs_quota_operations = {
+	.write_dquot	= dedupfs_write_dquot,
+	.acquire_dquot	= dedupfs_acquire_dquot,
+	.release_dquot	= dedupfs_release_dquot,
+	.mark_dirty	= dedupfs_mark_dquot_dirty,
+	.write_info	= dedupfs_write_info,
+	.alloc_dquot	= dquot_alloc,
+	.destroy_dquot	= dquot_destroy,
+};
+
+static const struct quotactl_ops dedupfs_qctl_operations = {
+	.quota_on	= dedupfs_quota_on,
+	.quota_off	= dquot_quota_off,
+	.quota_sync	= dquot_quota_sync,
+	.get_info	= dquot_get_dqinfo,
+	.set_info	= dquot_set_dqinfo,
+	.get_dqblk	= dquot_get_dqblk,
+	.set_dqblk	= dquot_set_dqblk
+};
+#endif
+
+static const struct super_operations dedupfs_sops = {
+	.alloc_inode	= dedupfs_alloc_inode,
+	.destroy_inode	= dedupfs_destroy_inode,
+	.write_inode	= dedupfs_write_inode,
+	.dirty_inode	= dedupfs_dirty_inode,
+	.evict_inode	= dedupfs_evict_inode,
+	.put_super	= dedupfs_put_super,
+	.sync_fs	= dedupfs_sync_fs,
+	.freeze_fs	= dedupfs_freeze,
+	.unfreeze_fs	= dedupfs_unfreeze,
+	.statfs		= dedupfs_statfs,
+	.remount_fs	= dedupfs_remount,
+	.show_options	= dedupfs_show_options,
+#ifdef CONFIG_QUOTA
+	.quota_read	= dedupfs_quota_read,
+	.quota_write	= dedupfs_quota_write,
+#endif
+	.bdev_try_to_free_page = bdev_try_to_free_page,
+};
+
 static const struct export_operations dedupfs_export_ops = {
 	.fh_to_dentry = dedupfs_fh_to_dentry,
 	.fh_to_parent = dedupfs_fh_to_parent,
 	.get_parent = dedupfs_get_parent,
 };
 
-static unsigned long get_sb_block(void **data)
-{
-	unsigned long 	sb_block;
-	char 		*options = (char *) *data;
-
-	if (!options || strncmp(options, "sb=", 3) != 0)
-		return 1;	/* Default location */
-	options += 3;
-	sb_block = simple_strtoul(options, &options, 0);
-	if (*options && *options != ',') {
-		printk("DEDUPFS-fs: Invalid sb specification: %s\n",
-		       (char *) *data);
-		return 1;
-	}
-	if (*options == ',')
-		options++;
-	*data = (void *) options;
-	return sb_block;
-}
-
 enum {
 	Opt_bsd_df, Opt_minix_df, Opt_grpid, Opt_nogrpid,
-	Opt_resgid, Opt_resuid, Opt_sb, Opt_err_cont, Opt_err_panic,
-	Opt_err_ro, Opt_nouid32, Opt_nocheck, Opt_debug,
-	Opt_oldalloc, Opt_orlov, Opt_nobh, Opt_user_xattr, Opt_nouser_xattr,
-	Opt_acl, Opt_noacl, Opt_xip, Opt_ignore, Opt_err, Opt_quota,
-	Opt_usrquota, Opt_grpquota, Opt_reservation, Opt_noreservation
+	Opt_resgid, Opt_resuid, Opt_sb, Opt_err_cont, Opt_err_panic, Opt_err_ro,
+	Opt_nouid32, Opt_nocheck, Opt_debug, Opt_oldalloc, Opt_orlov,
+	Opt_user_xattr, Opt_nouser_xattr, Opt_acl, Opt_noacl,
+	Opt_reservation, Opt_noreservation, Opt_noload, Opt_nobh, Opt_bh,
+	Opt_commit, Opt_journal_update, Opt_journal_inum, Opt_journal_dev,
+	Opt_abort, Opt_data_journal, Opt_data_ordered, Opt_data_writeback,
+	Opt_data_err_abort, Opt_data_err_ignore,
+	Opt_usrjquota, Opt_grpjquota, Opt_offusrjquota, Opt_offgrpjquota,
+	Opt_jqfmt_vfsold, Opt_jqfmt_vfsv0, Opt_jqfmt_vfsv1, Opt_quota,
+	Opt_noquota, Opt_ignore, Opt_barrier, Opt_nobarrier, Opt_err,
+	Opt_resize, Opt_usrquota, Opt_grpquota
 };
 
 static const match_table_t tokens = {
@@ -395,32 +819,139 @@ static const match_table_t tokens = {
 	{Opt_err_panic, "errors=panic"},
 	{Opt_err_ro, "errors=remount-ro"},
 	{Opt_nouid32, "nouid32"},
-	{Opt_nocheck, "check=none"},
 	{Opt_nocheck, "nocheck"},
+	{Opt_nocheck, "check=none"},
 	{Opt_debug, "debug"},
 	{Opt_oldalloc, "oldalloc"},
 	{Opt_orlov, "orlov"},
-	{Opt_nobh, "nobh"},
 	{Opt_user_xattr, "user_xattr"},
 	{Opt_nouser_xattr, "nouser_xattr"},
 	{Opt_acl, "acl"},
 	{Opt_noacl, "noacl"},
-	{Opt_xip, "xip"},
-	{Opt_grpquota, "grpquota"},
-	{Opt_ignore, "noquota"},
-	{Opt_quota, "quota"},
-	{Opt_usrquota, "usrquota"},
 	{Opt_reservation, "reservation"},
 	{Opt_noreservation, "noreservation"},
-	{Opt_err, NULL}
+	{Opt_noload, "noload"},
+	{Opt_noload, "norecovery"},
+	{Opt_nobh, "nobh"},
+	{Opt_bh, "bh"},
+	{Opt_commit, "commit=%u"},
+	{Opt_journal_update, "journal=update"},
+	{Opt_journal_inum, "journal=%u"},
+	{Opt_journal_dev, "journal_dev=%u"},
+	{Opt_abort, "abort"},
+	{Opt_data_journal, "data=journal"},
+	{Opt_data_ordered, "data=ordered"},
+	{Opt_data_writeback, "data=writeback"},
+	{Opt_data_err_abort, "data_err=abort"},
+	{Opt_data_err_ignore, "data_err=ignore"},
+	{Opt_offusrjquota, "usrjquota="},
+	{Opt_usrjquota, "usrjquota=%s"},
+	{Opt_offgrpjquota, "grpjquota="},
+	{Opt_grpjquota, "grpjquota=%s"},
+	{Opt_jqfmt_vfsold, "jqfmt=vfsold"},
+	{Opt_jqfmt_vfsv0, "jqfmt=vfsv0"},
+	{Opt_jqfmt_vfsv1, "jqfmt=vfsv1"},
+	{Opt_grpquota, "grpquota"},
+	{Opt_noquota, "noquota"},
+	{Opt_quota, "quota"},
+	{Opt_usrquota, "usrquota"},
+	{Opt_barrier, "barrier=%u"},
+	{Opt_barrier, "barrier"},
+	{Opt_nobarrier, "nobarrier"},
+	{Opt_resize, "resize"},
+	{Opt_err, NULL},
 };
 
-static int parse_options(char *options, struct super_block *sb)
+static dedupfsblk_t get_sb_block(void **data, struct super_block *sb)
 {
-	char *p;
+	dedupfsblk_t	sb_block;
+	char		*options = (char *) *data;
+
+	if (!options || strncmp(options, "sb=", 3) != 0)
+		return 1;	/* Default location */
+	options += 3;
+	/*todo: use simple_strtoll with >32bit dedupfs */
+	sb_block = simple_strtoul(options, &options, 0);
+	if (*options && *options != ',') {
+		dedupfs_msg(sb, "error: invalid sb specification: %s",
+		       (char *) *data);
+		return 1;
+	}
+	if (*options == ',')
+		options++;
+	*data = (void *) options;
+	return sb_block;
+}
+
+#ifdef CONFIG_QUOTA
+static int set_qf_name(struct super_block *sb, int qtype, substring_t *args)
+{
 	struct dedupfs_sb_info *sbi = DEDUPFS_SB(sb);
+	char *qname;
+
+	if (sb_any_quota_loaded(sb) &&
+		!sbi->s_qf_names[qtype]) {
+		dedupfs_msg(sb, KERN_ERR,
+			"Cannot change journaled "
+			"quota options when quota turned on");
+		return 0;
+	}
+	qname = match_strdup(args);
+	if (!qname) {
+		dedupfs_msg(sb, KERN_ERR,
+			"Not enough memory for storing quotafile name");
+		return 0;
+	}
+	if (sbi->s_qf_names[qtype] &&
+		strcmp(sbi->s_qf_names[qtype], qname)) {
+		dedupfs_msg(sb, KERN_ERR,
+			"%s quota file already specified", QTYPE2NAME(qtype));
+		kfree(qname);
+		return 0;
+	}
+	sbi->s_qf_names[qtype] = qname;
+	if (strchr(sbi->s_qf_names[qtype], '/')) {
+		dedupfs_msg(sb, KERN_ERR,
+			"quotafile must be on filesystem root");
+		kfree(sbi->s_qf_names[qtype]);
+		sbi->s_qf_names[qtype] = NULL;
+		return 0;
+	}
+	set_opt(sbi->s_mount_opt, QUOTA);
+	return 1;
+}
+
+static int clear_qf_name(struct super_block *sb, int qtype) {
+
+	struct dedupfs_sb_info *sbi = DEDUPFS_SB(sb);
+
+	if (sb_any_quota_loaded(sb) &&
+		sbi->s_qf_names[qtype]) {
+		dedupfs_msg(sb, KERN_ERR, "Cannot change journaled quota options"
+			" when quota turned on");
+		return 0;
+	}
+	/*
+	 * The space will be released later when all options are confirmed
+	 * to be correct
+	 */
+	sbi->s_qf_names[qtype] = NULL;
+	return 1;
+}
+#endif
+
+static int parse_options (char *options, struct super_block *sb,
+			  unsigned int *inum, unsigned long *journal_devnum,
+			  dedupfsblk_t *n_blocks_count, int is_remount)
+{
+	struct dedupfs_sb_info *sbi = DEDUPFS_SB(sb);
+	char * p;
 	substring_t args[MAX_OPT_ARGS];
+	int data_opt = 0;
 	int option;
+#ifdef CONFIG_QUOTA
+	int qfmt;
+#endif
 
 	if (!options)
 		return 1;
@@ -429,7 +960,11 @@ static int parse_options(char *options, struct super_block *sb)
 		int token;
 		if (!*p)
 			continue;
-
+		/*
+		 * Initialize args struct so we know whether arg was
+		 * found; some options take optional arguments.
+		 */
+		args[0].to = args[0].from = 0;
 		token = match_token(p, tokens, args);
 		switch (token) {
 		case Opt_bsd_df:
@@ -488,9 +1023,6 @@ static int parse_options(char *options, struct super_block *sb)
 		case Opt_orlov:
 			clear_opt (sbi->s_mount_opt, OLDALLOC);
 			break;
-		case Opt_nobh:
-			set_opt (sbi->s_mount_opt, NOBH);
-			break;
 #ifdef CONFIG_DEDUPFS_XATTR
 		case Opt_user_xattr:
 			set_opt (sbi->s_mount_opt, XATTR_USER);
@@ -501,8 +1033,8 @@ static int parse_options(char *options, struct super_block *sb)
 #else
 		case Opt_user_xattr:
 		case Opt_nouser_xattr:
-			dedupfs_msg(sb, KERN_INFO, "(no)user_xattr options"
-				"not supported");
+			dedupfs_msg(sb, KERN_INFO,
+				"(no)user_xattr options not supported");
 			break;
 #endif
 #ifdef CONFIG_DEDUPFS_POSIX_ACL
@@ -519,55 +1051,244 @@ static int parse_options(char *options, struct super_block *sb)
 				"(no)acl options not supported");
 			break;
 #endif
-		case Opt_xip:
-#ifdef CONFIG_DEDUPFS_XIP
-			set_opt (sbi->s_mount_opt, XIP);
-#else
-			dedupfs_msg(sb, KERN_INFO, "xip option not supported");
-#endif
-			break;
-
-#if defined(CONFIG_QUOTA)
-		case Opt_quota:
-		case Opt_usrquota:
-			set_opt(sbi->s_mount_opt, USRQUOTA);
-			break;
-
-		case Opt_grpquota:
-			set_opt(sbi->s_mount_opt, GRPQUOTA);
-			break;
-#else
-		case Opt_quota:
-		case Opt_usrquota:
-		case Opt_grpquota:
-			dedupfs_msg(sb, KERN_INFO,
-				"quota operations not supported");
-			break;
-#endif
-
 		case Opt_reservation:
 			set_opt(sbi->s_mount_opt, RESERVATION);
-			dedupfs_msg(sb, KERN_INFO, "reservations ON");
 			break;
 		case Opt_noreservation:
 			clear_opt(sbi->s_mount_opt, RESERVATION);
-			dedupfs_msg(sb, KERN_INFO, "reservations OFF");
+			break;
+		case Opt_journal_update:
+			/* @@@ FIXME */
+			/* Eventually we will want to be able to create
+			   a journal file here.  For now, only allow the
+			   user to specify an existing inode to be the
+			   journal file. */
+			if (is_remount) {
+				dedupfs_msg(sb, KERN_ERR, "error: cannot specify "
+					"journal on remount");
+				return 0;
+			}
+			set_opt (sbi->s_mount_opt, UPDATE_JOURNAL);
+			break;
+		case Opt_journal_inum:
+			if (is_remount) {
+				dedupfs_msg(sb, KERN_ERR, "error: cannot specify "
+				       "journal on remount");
+				return 0;
+			}
+			if (match_int(&args[0], &option))
+				return 0;
+			*inum = option;
+			break;
+		case Opt_journal_dev:
+			if (is_remount) {
+				dedupfs_msg(sb, KERN_ERR, "error: cannot specify "
+				       "journal on remount");
+				return 0;
+			}
+			if (match_int(&args[0], &option))
+				return 0;
+			*journal_devnum = option;
+			break;
+		case Opt_noload:
+			set_opt (sbi->s_mount_opt, NOLOAD);
+			break;
+		case Opt_commit:
+			if (match_int(&args[0], &option))
+				return 0;
+			if (option < 0)
+				return 0;
+			if (option == 0)
+				option = JBD_DEFAULT_MAX_COMMIT_AGE;
+			sbi->s_commit_interval = HZ * option;
+			break;
+		case Opt_data_journal:
+			data_opt = DEDUPFS_MOUNT_JOURNAL_DATA;
+			goto datacheck;
+		case Opt_data_ordered:
+			data_opt = DEDUPFS_MOUNT_ORDERED_DATA;
+			goto datacheck;
+		case Opt_data_writeback:
+			data_opt = DEDUPFS_MOUNT_WRITEBACK_DATA;
+		datacheck:
+			if (is_remount) {
+				if (test_opt(sb, DATA_FLAGS) == data_opt)
+					break;
+				dedupfs_msg(sb, KERN_ERR,
+					"error: cannot change "
+					"data mode on remount. The filesystem "
+					"is mounted in data=%s mode and you "
+					"try to remount it in data=%s mode.",
+					data_mode_string(test_opt(sb,
+							DATA_FLAGS)),
+					data_mode_string(data_opt));
+				return 0;
+			} else {
+				clear_opt(sbi->s_mount_opt, DATA_FLAGS);
+				sbi->s_mount_opt |= data_opt;
+			}
+			break;
+		case Opt_data_err_abort:
+			set_opt(sbi->s_mount_opt, DATA_ERR_ABORT);
+			break;
+		case Opt_data_err_ignore:
+			clear_opt(sbi->s_mount_opt, DATA_ERR_ABORT);
+			break;
+#ifdef CONFIG_QUOTA
+		case Opt_usrjquota:
+			if (!set_qf_name(sb, USRQUOTA, &args[0]))
+				return 0;
+			break;
+		case Opt_grpjquota:
+			if (!set_qf_name(sb, GRPQUOTA, &args[0]))
+				return 0;
+			break;
+		case Opt_offusrjquota:
+			if (!clear_qf_name(sb, USRQUOTA))
+				return 0;
+			break;
+		case Opt_offgrpjquota:
+			if (!clear_qf_name(sb, GRPQUOTA))
+				return 0;
+			break;
+		case Opt_jqfmt_vfsold:
+			qfmt = QFMT_VFS_OLD;
+			goto set_qf_format;
+		case Opt_jqfmt_vfsv0:
+			qfmt = QFMT_VFS_V0;
+			goto set_qf_format;
+		case Opt_jqfmt_vfsv1:
+			qfmt = QFMT_VFS_V1;
+set_qf_format:
+			if (sb_any_quota_loaded(sb) &&
+			    sbi->s_jquota_fmt != qfmt) {
+				dedupfs_msg(sb, KERN_ERR, "error: cannot change "
+					"journaled quota options when "
+					"quota turned on.");
+				return 0;
+			}
+			sbi->s_jquota_fmt = qfmt;
+			break;
+		case Opt_quota:
+		case Opt_usrquota:
+			set_opt(sbi->s_mount_opt, QUOTA);
+			set_opt(sbi->s_mount_opt, USRQUOTA);
+			break;
+		case Opt_grpquota:
+			set_opt(sbi->s_mount_opt, QUOTA);
+			set_opt(sbi->s_mount_opt, GRPQUOTA);
+			break;
+		case Opt_noquota:
+			if (sb_any_quota_loaded(sb)) {
+				dedupfs_msg(sb, KERN_ERR, "error: cannot change "
+					"quota options when quota turned on.");
+				return 0;
+			}
+			clear_opt(sbi->s_mount_opt, QUOTA);
+			clear_opt(sbi->s_mount_opt, USRQUOTA);
+			clear_opt(sbi->s_mount_opt, GRPQUOTA);
+			break;
+#else
+		case Opt_quota:
+		case Opt_usrquota:
+		case Opt_grpquota:
+			dedupfs_msg(sb, KERN_ERR,
+				"error: quota options not supported.");
+			break;
+		case Opt_usrjquota:
+		case Opt_grpjquota:
+		case Opt_offusrjquota:
+		case Opt_offgrpjquota:
+		case Opt_jqfmt_vfsold:
+		case Opt_jqfmt_vfsv0:
+		case Opt_jqfmt_vfsv1:
+			dedupfs_msg(sb, KERN_ERR,
+				"error: journaled quota options not "
+				"supported.");
+			break;
+		case Opt_noquota:
+			break;
+#endif
+		case Opt_abort:
+			set_opt(sbi->s_mount_opt, ABORT);
+			break;
+		case Opt_nobarrier:
+			clear_opt(sbi->s_mount_opt, BARRIER);
+			break;
+		case Opt_barrier:
+			if (args[0].from) {
+				if (match_int(&args[0], &option))
+					return 0;
+			} else
+				option = 1;	/* No argument, default to 1 */
+			if (option)
+				set_opt(sbi->s_mount_opt, BARRIER);
+			else
+				clear_opt(sbi->s_mount_opt, BARRIER);
 			break;
 		case Opt_ignore:
 			break;
+		case Opt_resize:
+			if (!is_remount) {
+				dedupfs_msg(sb, KERN_ERR,
+					"error: resize option only available "
+					"for remount");
+				return 0;
+			}
+			if (match_int(&args[0], &option) != 0)
+				return 0;
+			*n_blocks_count = option;
+			break;
+		case Opt_nobh:
+			dedupfs_msg(sb, KERN_WARNING,
+				"warning: ignoring deprecated nobh option");
+			break;
+		case Opt_bh:
+			dedupfs_msg(sb, KERN_WARNING,
+				"warning: ignoring deprecated bh option");
+			break;
 		default:
+			dedupfs_msg(sb, KERN_ERR,
+				"error: unrecognized mount option \"%s\" "
+				"or missing value", p);
 			return 0;
 		}
 	}
+#ifdef CONFIG_QUOTA
+	if (sbi->s_qf_names[USRQUOTA] || sbi->s_qf_names[GRPQUOTA]) {
+		if (test_opt(sb, USRQUOTA) && sbi->s_qf_names[USRQUOTA])
+			clear_opt(sbi->s_mount_opt, USRQUOTA);
+		if (test_opt(sb, GRPQUOTA) && sbi->s_qf_names[GRPQUOTA])
+			clear_opt(sbi->s_mount_opt, GRPQUOTA);
+
+		if (test_opt(sb, GRPQUOTA) || test_opt(sb, USRQUOTA)) {
+			dedupfs_msg(sb, KERN_ERR, "error: old and new quota "
+					"format mixing.");
+			return 0;
+		}
+
+		if (!sbi->s_jquota_fmt) {
+			dedupfs_msg(sb, KERN_ERR, "error: journaled quota format "
+					"not specified.");
+			return 0;
+		}
+	} else {
+		if (sbi->s_jquota_fmt) {
+			dedupfs_msg(sb, KERN_ERR, "error: journaled quota format "
+					"specified with no journaling "
+					"enabled.");
+			return 0;
+		}
+	}
+#endif
 	return 1;
 }
 
-static int dedupfs_setup_super (struct super_block * sb,
-			      struct dedupfs_super_block * es,
-			      int read_only)
+static int dedupfs_setup_super(struct super_block *sb, struct dedupfs_super_block *es,
+			    int read_only)
 {
-	int res = 0;
 	struct dedupfs_sb_info *sbi = DEDUPFS_SB(sb);
+	int res = 0;
 
 	if (le32_to_cpu(es->s_rev_level) > DEDUPFS_MAX_SUPP_REV) {
 		dedupfs_msg(sb, KERN_ERR,
@@ -597,32 +1318,52 @@ static int dedupfs_setup_super (struct super_block * sb,
 		dedupfs_msg(sb, KERN_WARNING,
 			"warning: checktime reached, "
 			"running e2fsck is recommended");
-	if (!le16_to_cpu(es->s_max_mnt_count))
+#if 0
+		/* @@@ We _will_ want to clear the valid bit if we find
+                   inconsistencies, to force a fsck at reboot.  But for
+                   a plain journaled filesystem we can keep it set as
+                   valid forever! :) */
+	es->s_state &= cpu_to_le16(~DEDUPFS_VALID_FS);
+#endif
+	if (!(__s16) le16_to_cpu(es->s_max_mnt_count))
 		es->s_max_mnt_count = cpu_to_le16(DEDUPFS_DFL_MAX_MNT_COUNT);
 	le16_add_cpu(&es->s_mnt_count, 1);
-	if (test_opt (sb, DEBUG))
-		dedupfs_msg(sb, KERN_INFO, "%s, %s, bs=%lu, fs=%lu, gc=%lu, "
-			"bpg=%lu, ipg=%lu, mo=%04lx]",
-			DEDUPFS_VERSION, DEDUPFS_DATE, sb->s_blocksize,
-			sbi->s_frag_size,
+	es->s_mtime = cpu_to_le32(get_seconds());
+	dedupfs_update_dynamic_rev(sb);
+	DEDUPFS_SET_INCOMPAT_FEATURE(sb, DEDUPFS_FEATURE_INCOMPAT_RECOVER);
+
+	dedupfs_commit_super(sb, es, 1);
+	if (test_opt(sb, DEBUG))
+		dedupfs_msg(sb, KERN_INFO, "[bs=%lu, gc=%lu, "
+				"bpg=%lu, ipg=%lu, mo=%04lx]",
+			sb->s_blocksize,
 			sbi->s_groups_count,
 			DEDUPFS_BLOCKS_PER_GROUP(sb),
 			DEDUPFS_INODES_PER_GROUP(sb),
 			sbi->s_mount_opt);
+
+	if (DEDUPFS_SB(sb)->s_journal->j_inode == NULL) {
+		char b[BDEVNAME_SIZE];
+		dedupfs_msg(sb, KERN_INFO, "using external journal on %s",
+			bdevname(DEDUPFS_SB(sb)->s_journal->j_dev, b));
+	} else {
+		dedupfs_msg(sb, KERN_INFO, "using internal journal");
+	}
 	return res;
 }
 
+/* Called at mount-time, super-block is locked */
 static int dedupfs_check_descriptors(struct super_block *sb)
 {
-	int i;
 	struct dedupfs_sb_info *sbi = DEDUPFS_SB(sb);
+	int i;
 
 	dedupfs_debug ("Checking group descriptors");
 
 	for (i = 0; i < sbi->s_groups_count; i++) {
 		struct dedupfs_group_desc *gdp = dedupfs_get_group_desc(sb, i, NULL);
-		dedupfs_fsblk_t first_block = dedupfs_group_first_block_no(sb, i);
-		dedupfs_fsblk_t last_block;
+		dedupfsblk_t first_block = dedupfs_group_first_block_no(sb, i);
+		dedupfsblk_t last_block;
 
 		if (i == sbi->s_groups_count - 1)
 			last_block = le32_to_cpu(sbi->s_es->s_blocks_count) - 1;
@@ -636,7 +1377,8 @@ static int dedupfs_check_descriptors(struct super_block *sb)
 			dedupfs_error (sb, "dedupfs_check_descriptors",
 				    "Block bitmap for group %d"
 				    " not in group (block %lu)!",
-				    i, (unsigned long) le32_to_cpu(gdp->bg_block_bitmap));
+				    i, (unsigned long)
+					le32_to_cpu(gdp->bg_block_bitmap));
 			return 0;
 		}
 		if (le32_to_cpu(gdp->bg_inode_bitmap) < first_block ||
@@ -645,7 +1387,8 @@ static int dedupfs_check_descriptors(struct super_block *sb)
 			dedupfs_error (sb, "dedupfs_check_descriptors",
 				    "Inode bitmap for group %d"
 				    " not in group (block %lu)!",
-				    i, (unsigned long) le32_to_cpu(gdp->bg_inode_bitmap));
+				    i, (unsigned long)
+					le32_to_cpu(gdp->bg_inode_bitmap));
 			return 0;
 		}
 		if (le32_to_cpu(gdp->bg_inode_table) < first_block ||
@@ -655,11 +1398,128 @@ static int dedupfs_check_descriptors(struct super_block *sb)
 			dedupfs_error (sb, "dedupfs_check_descriptors",
 				    "Inode table for group %d"
 				    " not in group (block %lu)!",
-				    i, (unsigned long) le32_to_cpu(gdp->bg_inode_table));
+				    i, (unsigned long)
+					le32_to_cpu(gdp->bg_inode_table));
 			return 0;
 		}
 	}
+
+	sbi->s_es->s_free_blocks_count=cpu_to_le32(dedupfs_count_free_blocks(sb));
+	sbi->s_es->s_free_inodes_count=cpu_to_le32(dedupfs_count_free_inodes(sb));
 	return 1;
+}
+
+
+/* dedupfs_orphan_cleanup() walks a singly-linked list of inodes (starting at
+ * the superblock) which were deleted from all directories, but held open by
+ * a process at the time of a crash.  We walk the list and try to delete these
+ * inodes at recovery time (only with a read-write filesystem).
+ *
+ * In order to keep the orphan inode chain consistent during traversal (in
+ * case of crash during recovery), we link each inode into the superblock
+ * orphan list_head and handle it the same way as an inode deletion during
+ * normal operation (which journals the operations for us).
+ *
+ * We only do an iget() and an iput() on each inode, which is very safe if we
+ * accidentally point at an in-use or already deleted inode.  The worst that
+ * can happen in this case is that we get a "bit already cleared" message from
+ * dedupfs_free_inode().  The only reason we would point at a wrong inode is if
+ * e2fsck was run on this filesystem, and it must have already done the orphan
+ * inode cleanup for us, so we can safely abort without any further action.
+ */
+static void dedupfs_orphan_cleanup (struct super_block * sb,
+				 struct dedupfs_super_block * es)
+{
+	unsigned int s_flags = sb->s_flags;
+	int nr_orphans = 0, nr_truncates = 0;
+#ifdef CONFIG_QUOTA
+	int i;
+#endif
+	if (!es->s_last_orphan) {
+		jbd_debug(4, "no orphan inodes to clean up\n");
+		return;
+	}
+
+	if (bdev_read_only(sb->s_bdev)) {
+		dedupfs_msg(sb, KERN_ERR, "error: write access "
+			"unavailable, skipping orphan cleanup.");
+		return;
+	}
+
+	if (DEDUPFS_SB(sb)->s_mount_state & DEDUPFS_ERROR_FS) {
+		if (es->s_last_orphan)
+			jbd_debug(1, "Errors on filesystem, "
+				  "clearing orphan list.\n");
+		es->s_last_orphan = 0;
+		jbd_debug(1, "Skipping orphan recovery on fs with errors.\n");
+		return;
+	}
+
+	if (s_flags & MS_RDONLY) {
+		dedupfs_msg(sb, KERN_INFO, "orphan cleanup on readonly fs");
+		sb->s_flags &= ~MS_RDONLY;
+	}
+#ifdef CONFIG_QUOTA
+	/* Needed for iput() to work correctly and not trash data */
+	sb->s_flags |= MS_ACTIVE;
+	/* Turn on quotas so that they are updated correctly */
+	for (i = 0; i < MAXQUOTAS; i++) {
+		if (DEDUPFS_SB(sb)->s_qf_names[i]) {
+			int ret = dedupfs_quota_on_mount(sb, i);
+			if (ret < 0)
+				dedupfs_msg(sb, KERN_ERR,
+					"error: cannot turn on journaled "
+					"quota: %d", ret);
+		}
+	}
+#endif
+
+	while (es->s_last_orphan) {
+		struct inode *inode;
+
+		inode = dedupfs_orphan_get(sb, le32_to_cpu(es->s_last_orphan));
+		if (IS_ERR(inode)) {
+			es->s_last_orphan = 0;
+			break;
+		}
+
+		list_add(&DEDUPFS_I(inode)->i_orphan, &DEDUPFS_SB(sb)->s_orphan);
+		dquot_initialize(inode);
+		if (inode->i_nlink) {
+			printk(KERN_DEBUG
+				"%s: truncating inode %lu to %Ld bytes\n",
+				__func__, inode->i_ino, inode->i_size);
+			jbd_debug(2, "truncating inode %lu to %Ld bytes\n",
+				  inode->i_ino, inode->i_size);
+			dedupfs_truncate(inode);
+			nr_truncates++;
+		} else {
+			printk(KERN_DEBUG
+				"%s: deleting unreferenced inode %lu\n",
+				__func__, inode->i_ino);
+			jbd_debug(2, "deleting unreferenced inode %lu\n",
+				  inode->i_ino);
+			nr_orphans++;
+		}
+		iput(inode);  /* The delete magic happens here! */
+	}
+
+#define PLURAL(x) (x), ((x)==1) ? "" : "s"
+
+	if (nr_orphans)
+		dedupfs_msg(sb, KERN_INFO, "%d orphan inode%s deleted",
+		       PLURAL(nr_orphans));
+	if (nr_truncates)
+		dedupfs_msg(sb, KERN_INFO, "%d truncate%s cleaned up",
+		       PLURAL(nr_truncates));
+#ifdef CONFIG_QUOTA
+	/* Turn quotas off */
+	for (i = 0; i < MAXQUOTAS; i++) {
+		if (sb_dqopt(sb)->files[i])
+			dquot_quota_off(sb, i);
+	}
+#endif
+	sb->s_flags = s_flags; /* Restore MS_RDONLY status */
 }
 
 /*
@@ -709,14 +1569,14 @@ static loff_t dedupfs_max_size(int bits)
 	return res;
 }
 
-static unsigned long descriptor_loc(struct super_block *sb,
-				    unsigned long logic_sb_block,
+static dedupfsblk_t descriptor_loc(struct super_block *sb,
+				    dedupfsblk_t logic_sb_block,
 				    int nr)
 {
 	struct dedupfs_sb_info *sbi = DEDUPFS_SB(sb);
 	unsigned long bg, first_meta_bg;
 	int has_super = 0;
-	
+
 	first_meta_bg = le32_to_cpu(sbi->s_es->s_first_meta_bg);
 
 	if (!DEDUPFS_HAS_INCOMPAT_FEATURE(sb, DEDUPFS_FEATURE_INCOMPAT_META_BG) ||
@@ -725,25 +1585,29 @@ static unsigned long descriptor_loc(struct super_block *sb,
 	bg = sbi->s_desc_per_block * nr;
 	if (dedupfs_bg_has_super(sb, bg))
 		has_super = 1;
-
-	return dedupfs_group_first_block_no(sb, bg) + has_super;
+	return (has_super + dedupfs_group_first_block_no(sb, bg));
 }
 
-static int dedupfs_fill_super(struct super_block *sb, void *data, int silent)
+
+static int dedupfs_fill_super (struct super_block *sb, void *data, int silent)
 {
 	struct buffer_head * bh;
-	struct dedupfs_sb_info * sbi;
-	struct dedupfs_super_block * es;
-	struct inode *root;
-	unsigned long block;
-	unsigned long sb_block = get_sb_block(&data);
-	unsigned long logic_sb_block;
+	struct dedupfs_super_block *es = NULL;
+	struct dedupfs_sb_info *sbi;
+	dedupfsblk_t block;
+	dedupfsblk_t sb_block = get_sb_block(&data, sb);
+	dedupfsblk_t logic_sb_block;
 	unsigned long offset = 0;
+	unsigned int journal_inum = 0;
+	unsigned long journal_devnum = 0;
 	unsigned long def_mount_opts;
-	long ret = -EINVAL;
-	int blocksize = BLOCK_SIZE;
+	struct inode *root;
+	int blocksize;
+	int hblock;
 	int db_count;
-	int i, j;
+	int i;
+	int needs_recovery;
+	int ret = -EINVAL;
 	__le32 features;
 	int err;
 
@@ -758,37 +1622,33 @@ static int dedupfs_fill_super(struct super_block *sb, void *data, int silent)
 		return -ENOMEM;
 	}
 	sb->s_fs_info = sbi;
+	sbi->s_mount_opt = 0;
+	sbi->s_resuid = DEDUPFS_DEF_RESUID;
+	sbi->s_resgid = DEDUPFS_DEF_RESGID;
 	sbi->s_sb_block = sb_block;
 
-	spin_lock_init(&sbi->s_lock);
+	unlock_kernel();
 
-	/*
-	 * See what the current blocksize for the device is, and
-	 * use that as the blocksize.  Otherwise (or if the blocksize
-	 * is smaller than the default) use the default.
-	 * This is important for devices that have a hardware
-	 * sectorsize that is larger than the default.
-	 */
-	blocksize = sb_min_blocksize(sb, BLOCK_SIZE);
+	blocksize = sb_min_blocksize(sb, DEDUPFS_MIN_BLOCK_SIZE);
 	if (!blocksize) {
 		dedupfs_msg(sb, KERN_ERR, "error: unable to set blocksize");
-		goto failed_sbi;
+		goto out_fail;
 	}
 
 	/*
-	 * If the superblock doesn't start on a hardware sector boundary,
-	 * calculate the offset.  
+	 * The dedupfs superblock will not be buffer aligned for other than 1kB
+	 * block sizes.  We need to calculate the offset from buffer start.
 	 */
-	if (blocksize != BLOCK_SIZE) {
-		logic_sb_block = (sb_block*BLOCK_SIZE) / blocksize;
-		offset = (sb_block*BLOCK_SIZE) % blocksize;
+	if (blocksize != DEDUPFS_MIN_BLOCK_SIZE) {
+		logic_sb_block = (sb_block * DEDUPFS_MIN_BLOCK_SIZE) / blocksize;
+		offset = (sb_block * DEDUPFS_MIN_BLOCK_SIZE) % blocksize;
 	} else {
 		logic_sb_block = sb_block;
 	}
 
 	if (!(bh = sb_bread(sb, logic_sb_block))) {
 		dedupfs_msg(sb, KERN_ERR, "error: unable to read superblock");
-		goto failed_sbi;
+		goto out_fail;
 	}
 	/*
 	 * Note: s_es must be initialized as soon as possible because
@@ -797,7 +1657,6 @@ static int dedupfs_fill_super(struct super_block *sb, void *data, int silent)
 	es = (struct dedupfs_super_block *) (((char *)bh->b_data) + offset);
 	sbi->s_es = es;
 	sb->s_magic = le16_to_cpu(es->s_magic);
-
 	if (sb->s_magic != DEDUPFS_SUPER_MAGIC)
 		goto cantfind_dedupfs;
 
@@ -817,7 +1676,13 @@ static int dedupfs_fill_super(struct super_block *sb, void *data, int silent)
 	if (def_mount_opts & DEDUPFS_DEFM_ACL)
 		set_opt(sbi->s_mount_opt, POSIX_ACL);
 #endif
-	
+	if ((def_mount_opts & DEDUPFS_DEFM_JMODE) == DEDUPFS_DEFM_JMODE_DATA)
+		set_opt(sbi->s_mount_opt, JOURNAL_DATA);
+	else if ((def_mount_opts & DEDUPFS_DEFM_JMODE) == DEDUPFS_DEFM_JMODE_ORDERED)
+		set_opt(sbi->s_mount_opt, ORDERED_DATA);
+	else if ((def_mount_opts & DEDUPFS_DEFM_JMODE) == DEDUPFS_DEFM_JMODE_WBACK)
+		set_opt(sbi->s_mount_opt, WRITEBACK_DATA);
+
 	if (le16_to_cpu(sbi->s_es->s_errors) == DEDUPFS_ERRORS_PANIC)
 		set_opt(sbi->s_mount_opt, ERRORS_PANIC);
 	else if (le16_to_cpu(sbi->s_es->s_errors) == DEDUPFS_ERRORS_CONTINUE)
@@ -827,18 +1692,15 @@ static int dedupfs_fill_super(struct super_block *sb, void *data, int silent)
 
 	sbi->s_resuid = le16_to_cpu(es->s_def_resuid);
 	sbi->s_resgid = le16_to_cpu(es->s_def_resgid);
-	
+
 	set_opt(sbi->s_mount_opt, RESERVATION);
 
-	if (!parse_options((char *) data, sb))
+	if (!parse_options ((char *) data, sb, &journal_inum, &journal_devnum,
+			    NULL, 0))
 		goto failed_mount;
 
 	sb->s_flags = (sb->s_flags & ~MS_POSIXACL) |
-		((DEDUPFS_SB(sb)->s_mount_opt & DEDUPFS_MOUNT_POSIX_ACL) ?
-		 MS_POSIXACL : 0);
-
-	dedupfs_xip_verify_sb(sb); /* see if bdev supports xip, unset
-				    DEDUPFS_MOUNT_XIP if not */
+		(test_opt(sb, POSIX_ACL) ? MS_POSIXACL : 0);
 
 	if (le32_to_cpu(es->s_rev_level) == DEDUPFS_GOOD_OLD_REV &&
 	    (DEDUPFS_HAS_COMPAT_FEATURE(sb, ~0U) ||
@@ -854,49 +1716,60 @@ static int dedupfs_fill_super(struct super_block *sb, void *data, int silent)
 	 */
 	features = DEDUPFS_HAS_INCOMPAT_FEATURE(sb, ~DEDUPFS_FEATURE_INCOMPAT_SUPP);
 	if (features) {
-		dedupfs_msg(sb, KERN_ERR,	"error: couldn't mount because of "
-		       "unsupported optional features (%x)",
-			le32_to_cpu(features));
+		dedupfs_msg(sb, KERN_ERR,
+			"error: couldn't mount because of unsupported "
+			"optional features (%x)", le32_to_cpu(features));
 		goto failed_mount;
 	}
-	if (!(sb->s_flags & MS_RDONLY) &&
-	    (features = DEDUPFS_HAS_RO_COMPAT_FEATURE(sb, ~DEDUPFS_FEATURE_RO_COMPAT_SUPP))){
-		dedupfs_msg(sb, KERN_ERR, "error: couldn't mount RDWR because of "
-		       "unsupported optional features (%x)",
-		       le32_to_cpu(features));
+	features = DEDUPFS_HAS_RO_COMPAT_FEATURE(sb, ~DEDUPFS_FEATURE_RO_COMPAT_SUPP);
+	if (!(sb->s_flags & MS_RDONLY) && features) {
+		dedupfs_msg(sb, KERN_ERR,
+			"error: couldn't mount RDWR because of unsupported "
+			"optional features (%x)", le32_to_cpu(features));
+		goto failed_mount;
+	}
+	blocksize = BLOCK_SIZE << le32_to_cpu(es->s_log_block_size);
+
+	if (blocksize < DEDUPFS_MIN_BLOCK_SIZE ||
+	    blocksize > DEDUPFS_MAX_BLOCK_SIZE) {
+		dedupfs_msg(sb, KERN_ERR,
+			"error: couldn't mount because of unsupported "
+			"filesystem blocksize %d", blocksize);
 		goto failed_mount;
 	}
 
-	blocksize = BLOCK_SIZE << le32_to_cpu(sbi->s_es->s_log_block_size);
-
-	if (dedupfs_use_xip(sb) && blocksize != PAGE_SIZE) {
-		if (!silent)
-			dedupfs_msg(sb, KERN_ERR,
-				"error: unsupported blocksize for xip");
-		goto failed_mount;
-	}
-
-	/* If the blocksize doesn't match, re-read the thing.. */
+	hblock = bdev_logical_block_size(sb->s_bdev);
 	if (sb->s_blocksize != blocksize) {
-		brelse(bh);
+		/*
+		 * Make sure the blocksize for the filesystem is larger
+		 * than the hardware sectorsize for the machine.
+		 */
+		if (blocksize < hblock) {
+			dedupfs_msg(sb, KERN_ERR,
+				"error: fsblocksize %d too small for "
+				"hardware sectorsize %d", blocksize, hblock);
+			goto failed_mount;
+		}
 
+		brelse (bh);
 		if (!sb_set_blocksize(sb, blocksize)) {
-			dedupfs_msg(sb, KERN_ERR, "error: blocksize is too small");
-			goto failed_sbi;
+			dedupfs_msg(sb, KERN_ERR,
+				"error: bad blocksize %d", blocksize);
+			goto out_fail;
 		}
-
-		logic_sb_block = (sb_block*BLOCK_SIZE) / blocksize;
-		offset = (sb_block*BLOCK_SIZE) % blocksize;
+		logic_sb_block = (sb_block * DEDUPFS_MIN_BLOCK_SIZE) / blocksize;
+		offset = (sb_block * DEDUPFS_MIN_BLOCK_SIZE) % blocksize;
 		bh = sb_bread(sb, logic_sb_block);
-		if(!bh) {
-			dedupfs_msg(sb, KERN_ERR, "error: couldn't read"
-				"superblock on 2nd try");
-			goto failed_sbi;
+		if (!bh) {
+			dedupfs_msg(sb, KERN_ERR,
+			       "error: can't read superblock on 2nd try");
+			goto failed_mount;
 		}
-		es = (struct dedupfs_super_block *) (((char *)bh->b_data) + offset);
+		es = (struct dedupfs_super_block *)(((char *)bh->b_data) + offset);
 		sbi->s_es = es;
 		if (es->s_magic != cpu_to_le16(DEDUPFS_SUPER_MAGIC)) {
-			dedupfs_msg(sb, KERN_ERR, "error: magic mismatch");
+			dedupfs_msg(sb, KERN_ERR,
+				"error: magic mismatch");
 			goto failed_mount;
 		}
 	}
@@ -910,7 +1783,7 @@ static int dedupfs_fill_super(struct super_block *sb, void *data, int silent)
 		sbi->s_inode_size = le16_to_cpu(es->s_inode_size);
 		sbi->s_first_ino = le32_to_cpu(es->s_first_ino);
 		if ((sbi->s_inode_size < DEDUPFS_GOOD_OLD_INODE_SIZE) ||
-		    !is_power_of_2(sbi->s_inode_size) ||
+		    (!is_power_of_2(sbi->s_inode_size)) ||
 		    (sbi->s_inode_size > blocksize)) {
 			dedupfs_msg(sb, KERN_ERR,
 				"error: unsupported inode size: %d",
@@ -918,100 +1791,104 @@ static int dedupfs_fill_super(struct super_block *sb, void *data, int silent)
 			goto failed_mount;
 		}
 	}
-
 	sbi->s_frag_size = DEDUPFS_MIN_FRAG_SIZE <<
 				   le32_to_cpu(es->s_log_frag_size);
-	if (sbi->s_frag_size == 0)
-		goto cantfind_dedupfs;
-	sbi->s_frags_per_block = sb->s_blocksize / sbi->s_frag_size;
-
+	if (blocksize != sbi->s_frag_size) {
+		dedupfs_msg(sb, KERN_ERR,
+		       "error: fragsize %lu != blocksize %u (unsupported)",
+		       sbi->s_frag_size, blocksize);
+		goto failed_mount;
+	}
+	sbi->s_frags_per_block = 1;
 	sbi->s_blocks_per_group = le32_to_cpu(es->s_blocks_per_group);
 	sbi->s_frags_per_group = le32_to_cpu(es->s_frags_per_group);
 	sbi->s_inodes_per_group = le32_to_cpu(es->s_inodes_per_group);
-
-	if (DEDUPFS_INODE_SIZE(sb) == 0)
+	if (DEDUPFS_INODE_SIZE(sb) == 0 || DEDUPFS_INODES_PER_GROUP(sb) == 0)
 		goto cantfind_dedupfs;
-	sbi->s_inodes_per_block = sb->s_blocksize / DEDUPFS_INODE_SIZE(sb);
-	if (sbi->s_inodes_per_block == 0 || sbi->s_inodes_per_group == 0)
+	sbi->s_inodes_per_block = blocksize / DEDUPFS_INODE_SIZE(sb);
+	if (sbi->s_inodes_per_block == 0)
 		goto cantfind_dedupfs;
 	sbi->s_itb_per_group = sbi->s_inodes_per_group /
 					sbi->s_inodes_per_block;
-	sbi->s_desc_per_block = sb->s_blocksize /
-					sizeof (struct dedupfs_group_desc);
+	sbi->s_desc_per_block = blocksize / sizeof(struct dedupfs_group_desc);
 	sbi->s_sbh = bh;
 	sbi->s_mount_state = le16_to_cpu(es->s_state);
-	sbi->s_addr_per_block_bits =
-		ilog2 (DEDUPFS_ADDR_PER_BLOCK(sb));
-	sbi->s_desc_per_block_bits =
-		ilog2 (DEDUPFS_DESC_PER_BLOCK(sb));
-
-	if (sb->s_magic != DEDUPFS_SUPER_MAGIC)
-		goto cantfind_dedupfs;
-
-	if (sb->s_blocksize != bh->b_size) {
-		if (!silent)
-			dedupfs_msg(sb, KERN_ERR, "error: unsupported blocksize");
-		goto failed_mount;
+	sbi->s_addr_per_block_bits = ilog2(DEDUPFS_ADDR_PER_BLOCK(sb));
+	sbi->s_desc_per_block_bits = ilog2(DEDUPFS_DESC_PER_BLOCK(sb));
+	for (i=0; i < 4; i++)
+		sbi->s_hash_seed[i] = le32_to_cpu(es->s_hash_seed[i]);
+	sbi->s_def_hash_version = es->s_def_hash_version;
+	i = le32_to_cpu(es->s_flags);
+	if (i & EXT2_FLAGS_UNSIGNED_HASH)
+		sbi->s_hash_unsigned = 3;
+	else if ((i & EXT2_FLAGS_SIGNED_HASH) == 0) {
+#ifdef __CHAR_UNSIGNED__
+		es->s_flags |= cpu_to_le32(EXT2_FLAGS_UNSIGNED_HASH);
+		sbi->s_hash_unsigned = 3;
+#else
+		es->s_flags |= cpu_to_le32(EXT2_FLAGS_SIGNED_HASH);
+#endif
 	}
 
-	if (sb->s_blocksize != sbi->s_frag_size) {
+	if (sbi->s_blocks_per_group > blocksize * 8) {
 		dedupfs_msg(sb, KERN_ERR,
-			"error: fragsize %lu != blocksize %lu"
-			"(not supported yet)",
-			sbi->s_frag_size, sb->s_blocksize);
-		goto failed_mount;
-	}
-
-	if (sbi->s_blocks_per_group > sb->s_blocksize * 8) {
-		dedupfs_msg(sb, KERN_ERR,
-			"error: #blocks per group too big: %lu",
+			"#blocks per group too big: %lu",
 			sbi->s_blocks_per_group);
 		goto failed_mount;
 	}
-	if (sbi->s_frags_per_group > sb->s_blocksize * 8) {
+	if (sbi->s_frags_per_group > blocksize * 8) {
 		dedupfs_msg(sb, KERN_ERR,
 			"error: #fragments per group too big: %lu",
 			sbi->s_frags_per_group);
 		goto failed_mount;
 	}
-	if (sbi->s_inodes_per_group > sb->s_blocksize * 8) {
+	if (sbi->s_inodes_per_group > blocksize * 8) {
 		dedupfs_msg(sb, KERN_ERR,
 			"error: #inodes per group too big: %lu",
 			sbi->s_inodes_per_group);
 		goto failed_mount;
 	}
 
-	if (DEDUPFS_BLOCKS_PER_GROUP(sb) == 0)
-		goto cantfind_dedupfs;
- 	sbi->s_groups_count = ((le32_to_cpu(es->s_blocks_count) -
- 				le32_to_cpu(es->s_first_data_block) - 1)
- 					/ DEDUPFS_BLOCKS_PER_GROUP(sb)) + 1;
-	db_count = (sbi->s_groups_count + DEDUPFS_DESC_PER_BLOCK(sb) - 1) /
-		   DEDUPFS_DESC_PER_BLOCK(sb);
-	sbi->s_group_desc = kmalloc (db_count * sizeof (struct buffer_head *), GFP_KERNEL);
-	if (sbi->s_group_desc == NULL) {
-		dedupfs_msg(sb, KERN_ERR, "error: not enough memory");
+	if (le32_to_cpu(es->s_blocks_count) >
+		    (sector_t)(~0ULL) >> (sb->s_blocksize_bits - 9)) {
+		dedupfs_msg(sb, KERN_ERR,
+			"error: filesystem is too large to mount safely");
+		if (sizeof(sector_t) < 8)
+			dedupfs_msg(sb, KERN_ERR,
+				"error: CONFIG_LBDAF not enabled");
 		goto failed_mount;
 	}
-	bgl_lock_init(sbi->s_blockgroup_lock);
-	sbi->s_debts = kcalloc(sbi->s_groups_count, sizeof(*sbi->s_debts), GFP_KERNEL);
-	if (!sbi->s_debts) {
-		dedupfs_msg(sb, KERN_ERR, "error: not enough memory");
-		goto failed_mount_group_desc;
+
+	if (DEDUPFS_BLOCKS_PER_GROUP(sb) == 0)
+		goto cantfind_dedupfs;
+	sbi->s_groups_count = ((le32_to_cpu(es->s_blocks_count) -
+			       le32_to_cpu(es->s_first_data_block) - 1)
+				       / DEDUPFS_BLOCKS_PER_GROUP(sb)) + 1;
+	db_count = (sbi->s_groups_count + DEDUPFS_DESC_PER_BLOCK(sb) - 1) /
+		   DEDUPFS_DESC_PER_BLOCK(sb);
+	sbi->s_group_desc = kmalloc(db_count * sizeof (struct buffer_head *),
+				    GFP_KERNEL);
+	if (sbi->s_group_desc == NULL) {
+		dedupfs_msg(sb, KERN_ERR,
+			"error: not enough memory");
+		goto failed_mount;
 	}
+
+	bgl_lock_init(sbi->s_blockgroup_lock);
+
 	for (i = 0; i < db_count; i++) {
 		block = descriptor_loc(sb, logic_sb_block, i);
 		sbi->s_group_desc[i] = sb_bread(sb, block);
 		if (!sbi->s_group_desc[i]) {
-			for (j = 0; j < i; j++)
-				brelse (sbi->s_group_desc[j]);
 			dedupfs_msg(sb, KERN_ERR,
-				"error: unable to read group descriptors");
-			goto failed_mount_group_desc;
+				"error: can't read group descriptor %d", i);
+			db_count = i;
+			goto failed_mount2;
 		}
 	}
 	if (!dedupfs_check_descriptors (sb)) {
-		dedupfs_msg(sb, KERN_ERR, "group descriptors corrupted");
+		dedupfs_msg(sb, KERN_ERR,
+			"error: group descriptors corrupted");
 		goto failed_mount2;
 	}
 	sbi->s_gdb_count = db_count;
@@ -1021,20 +1898,56 @@ static int dedupfs_fill_super(struct super_block *sb, void *data, int silent)
 	/* per fileystem reservation list head & lock */
 	spin_lock_init(&sbi->s_rsv_window_lock);
 	sbi->s_rsv_window_root = RB_ROOT;
-	/*
-	 * Add a single, static dummy reservation to the start of the
+	/* Add a single, static dummy reservation to the start of the
 	 * reservation window list --- it gives us a placeholder for
 	 * append-at-start-of-list which makes the allocation logic
-	 * _much_ simpler.
-	 */
+	 * _much_ simpler. */
 	sbi->s_rsv_window_head.rsv_start = DEDUPFS_RESERVE_WINDOW_NOT_ALLOCATED;
 	sbi->s_rsv_window_head.rsv_end = DEDUPFS_RESERVE_WINDOW_NOT_ALLOCATED;
 	sbi->s_rsv_window_head.rsv_alloc_hit = 0;
 	sbi->s_rsv_window_head.rsv_goal_size = 0;
 	dedupfs_rsv_window_add(sb, &sbi->s_rsv_window_head);
 
+	/*
+	 * set up enough so that it can read an inode
+	 */
+	sb->s_op = &dedupfs_sops;
+	sb->s_export_op = &dedupfs_export_ops;
+	sb->s_xattr = dedupfs_xattr_handlers;
+#ifdef CONFIG_QUOTA
+	sb->s_qcop = &dedupfs_qctl_operations;
+	sb->dq_op = &dedupfs_quota_operations;
+#endif
+	INIT_LIST_HEAD(&sbi->s_orphan); /* unlinked but open files */
+	mutex_init(&sbi->s_orphan_lock);
+	mutex_init(&sbi->s_resize_lock);
+
+	sb->s_root = NULL;
+
+	needs_recovery = (es->s_last_orphan != 0 ||
+			  DEDUPFS_HAS_INCOMPAT_FEATURE(sb,
+				    DEDUPFS_FEATURE_INCOMPAT_RECOVER));
+
+	/*
+	 * The first inode we look at is the journal inode.  Don't try
+	 * root first: it may be modified in the journal!
+	 */
+	if (!test_opt(sb, NOLOAD) &&
+	    DEDUPFS_HAS_COMPAT_FEATURE(sb, DEDUPFS_FEATURE_COMPAT_HAS_JOURNAL)) {
+		if (dedupfs_load_journal(sb, es, journal_devnum))
+			goto failed_mount2;
+	} else if (journal_inum) {
+		if (dedupfs_create_journal(sb, es, journal_inum))
+			goto failed_mount2;
+	} else {
+		if (!silent)
+			dedupfs_msg(sb, KERN_ERR,
+				"error: no journal found. "
+				"mounting dedupfs over ext2?");
+		goto failed_mount2;
+	}
 	err = percpu_counter_init(&sbi->s_freeblocks_counter,
-				dedupfs_count_free_blocks(sb));
+			dedupfs_count_free_blocks(sb));
 	if (!err) {
 		err = percpu_counter_init(&sbi->s_freeinodes_counter,
 				dedupfs_count_free_inodes(sb));
@@ -1047,20 +1960,42 @@ static int dedupfs_fill_super(struct super_block *sb, void *data, int silent)
 		dedupfs_msg(sb, KERN_ERR, "error: insufficient memory");
 		goto failed_mount3;
 	}
-	/*
-	 * set up enough so that it can read an inode
-	 */
-	sb->s_op = &dedupfs_sops;
-	sb->s_export_op = &dedupfs_export_ops;
-	sb->s_xattr = dedupfs_xattr_handlers;
 
-#ifdef CONFIG_QUOTA
-	sb->dq_op = &dquot_operations;
-	sb->s_qcop = &dquot_quotactl_ops;
-#endif
+	/* We have now updated the journal if required, so we can
+	 * validate the data journaling mode. */
+	switch (test_opt(sb, DATA_FLAGS)) {
+	case 0:
+		/* No mode set, assume a default based on the journal
+                   capabilities: ORDERED_DATA if the journal can
+                   cope, else JOURNAL_DATA */
+		if (journal_check_available_features
+		    (sbi->s_journal, 0, 0, JFS_FEATURE_INCOMPAT_REVOKE))
+			set_opt(sbi->s_mount_opt, DEFAULT_DATA_MODE);
+		else
+			set_opt(sbi->s_mount_opt, JOURNAL_DATA);
+		break;
+
+	case DEDUPFS_MOUNT_ORDERED_DATA:
+	case DEDUPFS_MOUNT_WRITEBACK_DATA:
+		if (!journal_check_available_features
+		    (sbi->s_journal, 0, 0, JFS_FEATURE_INCOMPAT_REVOKE)) {
+			dedupfs_msg(sb, KERN_ERR,
+				"error: journal does not support "
+				"requested data journaling mode");
+			goto failed_mount3;
+		}
+	default:
+		break;
+	}
+
+	/*
+	 * The journal_load will have done any necessary log recovery,
+	 * so we can safely mount the rest of the filesystem now.
+	 */
 
 	root = dedupfs_iget(sb, DEDUPFS_ROOT_INO);
 	if (IS_ERR(root)) {
+		dedupfs_msg(sb, KERN_ERR, "error: get root inode failed");
 		ret = PTR_ERR(root);
 		goto failed_mount3;
 	}
@@ -1069,223 +2004,672 @@ static int dedupfs_fill_super(struct super_block *sb, void *data, int silent)
 		dedupfs_msg(sb, KERN_ERR, "error: corrupt root inode, run e2fsck");
 		goto failed_mount3;
 	}
-
 	sb->s_root = d_alloc_root(root);
 	if (!sb->s_root) {
+		dedupfs_msg(sb, KERN_ERR, "error: get root dentry failed");
 		iput(root);
-		dedupfs_msg(sb, KERN_ERR, "error: get root inode failed");
 		ret = -ENOMEM;
 		goto failed_mount3;
 	}
-	if (DEDUPFS_HAS_COMPAT_FEATURE(sb, EXT3_FEATURE_COMPAT_HAS_JOURNAL))
-		dedupfs_msg(sb, KERN_WARNING,
-			"warning: mounting ext3 filesystem as dedupfs");
-	if (dedupfs_setup_super (sb, es, sb->s_flags & MS_RDONLY))
-		sb->s_flags |= MS_RDONLY;
-	dedupfs_write_super(sb);
+
+	dedupfs_setup_super (sb, es, sb->s_flags & MS_RDONLY);
+
+	DEDUPFS_SB(sb)->s_mount_state |= DEDUPFS_ORPHAN_FS;
+	dedupfs_orphan_cleanup(sb, es);
+	DEDUPFS_SB(sb)->s_mount_state &= ~DEDUPFS_ORPHAN_FS;
+	if (needs_recovery)
+		dedupfs_msg(sb, KERN_INFO, "recovery complete");
+	dedupfs_mark_recovery_complete(sb, es);
+	dedupfs_msg(sb, KERN_INFO, "mounted filesystem with %s data mode",
+		test_opt(sb,DATA_FLAGS) == DEDUPFS_MOUNT_JOURNAL_DATA ? "journal":
+		test_opt(sb,DATA_FLAGS) == DEDUPFS_MOUNT_ORDERED_DATA ? "ordered":
+		"writeback");
+
+	lock_kernel();
 	return 0;
 
 cantfind_dedupfs:
 	if (!silent)
-		dedupfs_msg(sb, KERN_ERR,
-			"error: can't find an dedupfs filesystem on dev %s.",
-			sb->s_id);
+		dedupfs_msg(sb, KERN_INFO,
+			"error: can't find dedupfs filesystem on dev %s.",
+		       sb->s_id);
 	goto failed_mount;
+
 failed_mount3:
 	percpu_counter_destroy(&sbi->s_freeblocks_counter);
 	percpu_counter_destroy(&sbi->s_freeinodes_counter);
 	percpu_counter_destroy(&sbi->s_dirs_counter);
+	journal_destroy(sbi->s_journal);
 failed_mount2:
 	for (i = 0; i < db_count; i++)
 		brelse(sbi->s_group_desc[i]);
-failed_mount_group_desc:
 	kfree(sbi->s_group_desc);
-	kfree(sbi->s_debts);
 failed_mount:
+#ifdef CONFIG_QUOTA
+	for (i = 0; i < MAXQUOTAS; i++)
+		kfree(sbi->s_qf_names[i]);
+#endif
+	dedupfs_blkdev_remove(sbi);
 	brelse(bh);
-failed_sbi:
+out_fail:
 	sb->s_fs_info = NULL;
 	kfree(sbi->s_blockgroup_lock);
 	kfree(sbi);
+	lock_kernel();
 	return ret;
 }
 
-static void dedupfs_clear_super_error(struct super_block *sb)
-{
-	struct buffer_head *sbh = DEDUPFS_SB(sb)->s_sbh;
-
-	if (buffer_write_io_error(sbh)) {
-		/*
-		 * Oh, dear.  A previous attempt to write the
-		 * superblock failed.  This could happen because the
-		 * USB device was yanked out.  Or it could happen to
-		 * be a transient write error and maybe the block will
-		 * be remapped.  Nothing we can do but to retry the
-		 * write and hope for the best.
-		 */
-		dedupfs_msg(sb, KERN_ERR,
-		       "previous I/O error to superblock detected\n");
-		clear_buffer_write_io_error(sbh);
-		set_buffer_uptodate(sbh);
-	}
-}
-
-static void dedupfs_sync_super(struct super_block *sb, struct dedupfs_super_block *es,
-			    int wait)
-{
-	dedupfs_clear_super_error(sb);
-	spin_lock(&DEDUPFS_SB(sb)->s_lock);
-	es->s_free_blocks_count = cpu_to_le32(dedupfs_count_free_blocks(sb));
-	es->s_free_inodes_count = cpu_to_le32(dedupfs_count_free_inodes(sb));
-	es->s_wtime = cpu_to_le32(get_seconds());
-	/* unlock before we do IO */
-	spin_unlock(&DEDUPFS_SB(sb)->s_lock);
-	mark_buffer_dirty(DEDUPFS_SB(sb)->s_sbh);
-	if (wait)
-		sync_dirty_buffer(DEDUPFS_SB(sb)->s_sbh);
-	sb->s_dirt = 0;
-}
-
 /*
- * In the second extended file system, it is not necessary to
- * write the super block since we use a mapping of the
- * disk super block in a buffer.
- *
- * However, this function is still used to set the fs valid
- * flags to 0.  We need to set this flag to 0 since the fs
- * may have been checked while mounted and e2fsck may have
- * set s_state to DEDUPFS_VALID_FS after some corrections.
+ * Setup any per-fs journal parameters now.  We'll do this both on
+ * initial mount, once the journal has been initialised but before we've
+ * done any recovery; and again on any subsequent remount.
  */
-static int dedupfs_sync_fs(struct super_block *sb, int wait)
+static void dedupfs_init_journal_params(struct super_block *sb, journal_t *journal)
 {
 	struct dedupfs_sb_info *sbi = DEDUPFS_SB(sb);
-	struct dedupfs_super_block *es = DEDUPFS_SB(sb)->s_es;
 
-	spin_lock(&sbi->s_lock);
-	if (es->s_state & cpu_to_le16(DEDUPFS_VALID_FS)) {
-		dedupfs_debug("setting valid to 0\n");
-		es->s_state &= cpu_to_le16(~DEDUPFS_VALID_FS);
+	if (sbi->s_commit_interval)
+		journal->j_commit_interval = sbi->s_commit_interval;
+	/* We could also set up an dedupfs-specific default for the commit
+	 * interval here, but for now we'll just fall back to the jbd
+	 * default. */
+
+	spin_lock(&journal->j_state_lock);
+	if (test_opt(sb, BARRIER))
+		journal->j_flags |= JFS_BARRIER;
+	else
+		journal->j_flags &= ~JFS_BARRIER;
+	if (test_opt(sb, DATA_ERR_ABORT))
+		journal->j_flags |= JFS_ABORT_ON_SYNCDATA_ERR;
+	else
+		journal->j_flags &= ~JFS_ABORT_ON_SYNCDATA_ERR;
+	spin_unlock(&journal->j_state_lock);
+}
+
+static journal_t *dedupfs_get_journal(struct super_block *sb,
+				   unsigned int journal_inum)
+{
+	struct inode *journal_inode;
+	journal_t *journal;
+
+	/* First, test for the existence of a valid inode on disk.  Bad
+	 * things happen if we iget() an unused inode, as the subsequent
+	 * iput() will try to delete it. */
+
+	journal_inode = dedupfs_iget(sb, journal_inum);
+	if (IS_ERR(journal_inode)) {
+		dedupfs_msg(sb, KERN_ERR, "error: no journal found");
+		return NULL;
 	}
-	spin_unlock(&sbi->s_lock);
-	dedupfs_sync_super(sb, es, wait);
+	if (!journal_inode->i_nlink) {
+		make_bad_inode(journal_inode);
+		iput(journal_inode);
+		dedupfs_msg(sb, KERN_ERR, "error: journal inode is deleted");
+		return NULL;
+	}
+
+	jbd_debug(2, "Journal inode found at %p: %Ld bytes\n",
+		  journal_inode, journal_inode->i_size);
+	if (!S_ISREG(journal_inode->i_mode)) {
+		dedupfs_msg(sb, KERN_ERR, "error: invalid journal inode");
+		iput(journal_inode);
+		return NULL;
+	}
+
+	journal = journal_init_inode(journal_inode);
+	if (!journal) {
+		dedupfs_msg(sb, KERN_ERR, "error: could not load journal inode");
+		iput(journal_inode);
+		return NULL;
+	}
+	journal->j_private = sb;
+	dedupfs_init_journal_params(sb, journal);
+	return journal;
+}
+
+static journal_t *dedupfs_get_dev_journal(struct super_block *sb,
+				       dev_t j_dev)
+{
+	struct buffer_head * bh;
+	journal_t *journal;
+	dedupfsblk_t start;
+	dedupfsblk_t len;
+	int hblock, blocksize;
+	dedupfsblk_t sb_block;
+	unsigned long offset;
+	struct dedupfs_super_block * es;
+	struct block_device *bdev;
+
+	bdev = dedupfs_blkdev_get(j_dev, sb);
+	if (bdev == NULL)
+		return NULL;
+
+	if (bd_claim(bdev, sb)) {
+		dedupfs_msg(sb, KERN_ERR,
+			"error: failed to claim external journal device");
+		blkdev_put(bdev, FMODE_READ|FMODE_WRITE);
+		return NULL;
+	}
+
+	blocksize = sb->s_blocksize;
+	hblock = bdev_logical_block_size(bdev);
+	if (blocksize < hblock) {
+		dedupfs_msg(sb, KERN_ERR,
+			"error: blocksize too small for journal device");
+		goto out_bdev;
+	}
+
+	sb_block = DEDUPFS_MIN_BLOCK_SIZE / blocksize;
+	offset = DEDUPFS_MIN_BLOCK_SIZE % blocksize;
+	set_blocksize(bdev, blocksize);
+	if (!(bh = __bread(bdev, sb_block, blocksize))) {
+		dedupfs_msg(sb, KERN_ERR, "error: couldn't read superblock of "
+			"external journal");
+		goto out_bdev;
+	}
+
+	es = (struct dedupfs_super_block *) (((char *)bh->b_data) + offset);
+	if ((le16_to_cpu(es->s_magic) != DEDUPFS_SUPER_MAGIC) ||
+	    !(le32_to_cpu(es->s_feature_incompat) &
+	      DEDUPFS_FEATURE_INCOMPAT_JOURNAL_DEV)) {
+		dedupfs_msg(sb, KERN_ERR, "error: external journal has "
+			"bad superblock");
+		brelse(bh);
+		goto out_bdev;
+	}
+
+	if (memcmp(DEDUPFS_SB(sb)->s_es->s_journal_uuid, es->s_uuid, 16)) {
+		dedupfs_msg(sb, KERN_ERR, "error: journal UUID does not match");
+		brelse(bh);
+		goto out_bdev;
+	}
+
+	len = le32_to_cpu(es->s_blocks_count);
+	start = sb_block + 1;
+	brelse(bh);	/* we're done with the superblock */
+
+	journal = journal_init_dev(bdev, sb->s_bdev,
+					start, len, blocksize);
+	if (!journal) {
+		dedupfs_msg(sb, KERN_ERR,
+			"error: failed to create device journal");
+		goto out_bdev;
+	}
+	journal->j_private = sb;
+	ll_rw_block(READ, 1, &journal->j_sb_buffer);
+	wait_on_buffer(journal->j_sb_buffer);
+	if (!buffer_uptodate(journal->j_sb_buffer)) {
+		dedupfs_msg(sb, KERN_ERR, "I/O error on journal device");
+		goto out_journal;
+	}
+	if (be32_to_cpu(journal->j_superblock->s_nr_users) != 1) {
+		dedupfs_msg(sb, KERN_ERR,
+			"error: external journal has more than one "
+			"user (unsupported) - %d",
+			be32_to_cpu(journal->j_superblock->s_nr_users));
+		goto out_journal;
+	}
+	DEDUPFS_SB(sb)->journal_bdev = bdev;
+	dedupfs_init_journal_params(sb, journal);
+	return journal;
+out_journal:
+	journal_destroy(journal);
+out_bdev:
+	dedupfs_blkdev_put(bdev);
+	return NULL;
+}
+
+static int dedupfs_load_journal(struct super_block *sb,
+			     struct dedupfs_super_block *es,
+			     unsigned long journal_devnum)
+{
+	journal_t *journal;
+	unsigned int journal_inum = le32_to_cpu(es->s_journal_inum);
+	dev_t journal_dev;
+	int err = 0;
+	int really_read_only;
+
+	if (journal_devnum &&
+	    journal_devnum != le32_to_cpu(es->s_journal_dev)) {
+		dedupfs_msg(sb, KERN_INFO, "external journal device major/minor "
+			"numbers have changed");
+		journal_dev = new_decode_dev(journal_devnum);
+	} else
+		journal_dev = new_decode_dev(le32_to_cpu(es->s_journal_dev));
+
+	really_read_only = bdev_read_only(sb->s_bdev);
+
+	/*
+	 * Are we loading a blank journal or performing recovery after a
+	 * crash?  For recovery, we need to check in advance whether we
+	 * can get read-write access to the device.
+	 */
+
+	if (DEDUPFS_HAS_INCOMPAT_FEATURE(sb, DEDUPFS_FEATURE_INCOMPAT_RECOVER)) {
+		if (sb->s_flags & MS_RDONLY) {
+			dedupfs_msg(sb, KERN_INFO,
+				"recovery required on readonly filesystem");
+			if (really_read_only) {
+				dedupfs_msg(sb, KERN_ERR, "error: write access "
+					"unavailable, cannot proceed");
+				return -EROFS;
+			}
+			dedupfs_msg(sb, KERN_INFO,
+				"write access will be enabled during recovery");
+		}
+	}
+
+	if (journal_inum && journal_dev) {
+		dedupfs_msg(sb, KERN_ERR, "error: filesystem has both journal "
+		       "and inode journals");
+		return -EINVAL;
+	}
+
+	if (journal_inum) {
+		if (!(journal = dedupfs_get_journal(sb, journal_inum)))
+			return -EINVAL;
+	} else {
+		if (!(journal = dedupfs_get_dev_journal(sb, journal_dev)))
+			return -EINVAL;
+	}
+
+	if (!(journal->j_flags & JFS_BARRIER))
+		printk(KERN_INFO "DEDUPFS-fs: barriers not enabled\n");
+
+	if (!really_read_only && test_opt(sb, UPDATE_JOURNAL)) {
+		err = journal_update_format(journal);
+		if (err)  {
+			dedupfs_msg(sb, KERN_ERR, "error updating journal");
+			journal_destroy(journal);
+			return err;
+		}
+	}
+
+	if (!DEDUPFS_HAS_INCOMPAT_FEATURE(sb, DEDUPFS_FEATURE_INCOMPAT_RECOVER))
+		err = journal_wipe(journal, !really_read_only);
+	if (!err)
+		err = journal_load(journal);
+
+	if (err) {
+		dedupfs_msg(sb, KERN_ERR, "error loading journal");
+		journal_destroy(journal);
+		return err;
+	}
+
+	DEDUPFS_SB(sb)->s_journal = journal;
+	dedupfs_clear_journal_err(sb, es);
+
+	if (journal_devnum &&
+	    journal_devnum != le32_to_cpu(es->s_journal_dev)) {
+		es->s_journal_dev = cpu_to_le32(journal_devnum);
+
+		/* Make sure we flush the recovery flag to disk. */
+		dedupfs_commit_super(sb, es, 1);
+	}
+
 	return 0;
 }
 
-
-void dedupfs_write_super(struct super_block *sb)
+static int dedupfs_create_journal(struct super_block *sb,
+			       struct dedupfs_super_block *es,
+			       unsigned int journal_inum)
 {
+	journal_t *journal;
+	int err;
+
+	if (sb->s_flags & MS_RDONLY) {
+		dedupfs_msg(sb, KERN_ERR,
+			"error: readonly filesystem when trying to "
+			"create journal");
+		return -EROFS;
+	}
+
+	journal = dedupfs_get_journal(sb, journal_inum);
+	if (!journal)
+		return -EINVAL;
+
+	dedupfs_msg(sb, KERN_INFO, "creating new journal on inode %u",
+	       journal_inum);
+
+	err = journal_create(journal);
+	if (err) {
+		dedupfs_msg(sb, KERN_ERR, "error creating journal");
+		journal_destroy(journal);
+		return -EIO;
+	}
+
+	DEDUPFS_SB(sb)->s_journal = journal;
+
+	dedupfs_update_dynamic_rev(sb);
+	DEDUPFS_SET_INCOMPAT_FEATURE(sb, DEDUPFS_FEATURE_INCOMPAT_RECOVER);
+	DEDUPFS_SET_COMPAT_FEATURE(sb, DEDUPFS_FEATURE_COMPAT_HAS_JOURNAL);
+
+	es->s_journal_inum = cpu_to_le32(journal_inum);
+
+	/* Make sure we flush the recovery flag to disk. */
+	dedupfs_commit_super(sb, es, 1);
+
+	return 0;
+}
+
+static int dedupfs_commit_super(struct super_block *sb,
+			       struct dedupfs_super_block *es,
+			       int sync)
+{
+	struct buffer_head *sbh = DEDUPFS_SB(sb)->s_sbh;
+	int error = 0;
+
+	if (!sbh)
+		return error;
+	/*
+	 * If the file system is mounted read-only, don't update the
+	 * superblock write time.  This avoids updating the superblock
+	 * write time when we are mounting the root file system
+	 * read/only but we need to replay the journal; at that point,
+	 * for people who are east of GMT and who make their clock
+	 * tick in localtime for Windows bug-for-bug compatibility,
+	 * the clock is set in the future, and this will cause e2fsck
+	 * to complain and force a full file system check.
+	 */
 	if (!(sb->s_flags & MS_RDONLY))
-		dedupfs_sync_fs(sb, 1);
-	else
-		sb->s_dirt = 0;
+		es->s_wtime = cpu_to_le32(get_seconds());
+	es->s_free_blocks_count = cpu_to_le32(dedupfs_count_free_blocks(sb));
+	es->s_free_inodes_count = cpu_to_le32(dedupfs_count_free_inodes(sb));
+	BUFFER_TRACE(sbh, "marking dirty");
+	mark_buffer_dirty(sbh);
+	if (sync)
+		error = sync_dirty_buffer(sbh);
+	return error;
+}
+
+
+/*
+ * Have we just finished recovery?  If so, and if we are mounting (or
+ * remounting) the filesystem readonly, then we will end up with a
+ * consistent fs on disk.  Record that fact.
+ */
+static void dedupfs_mark_recovery_complete(struct super_block * sb,
+					struct dedupfs_super_block * es)
+{
+	journal_t *journal = DEDUPFS_SB(sb)->s_journal;
+
+	journal_lock_updates(journal);
+	if (journal_flush(journal) < 0)
+		goto out;
+
+	if (DEDUPFS_HAS_INCOMPAT_FEATURE(sb, DEDUPFS_FEATURE_INCOMPAT_RECOVER) &&
+	    sb->s_flags & MS_RDONLY) {
+		DEDUPFS_CLEAR_INCOMPAT_FEATURE(sb, DEDUPFS_FEATURE_INCOMPAT_RECOVER);
+		dedupfs_commit_super(sb, es, 1);
+	}
+
+out:
+	journal_unlock_updates(journal);
+}
+
+/*
+ * If we are mounting (or read-write remounting) a filesystem whose journal
+ * has recorded an error from a previous lifetime, move that error to the
+ * main filesystem now.
+ */
+static void dedupfs_clear_journal_err(struct super_block *sb,
+				   struct dedupfs_super_block *es)
+{
+	journal_t *journal;
+	int j_errno;
+	const char *errstr;
+
+	journal = DEDUPFS_SB(sb)->s_journal;
+
+	/*
+	 * Now check for any error status which may have been recorded in the
+	 * journal by a prior dedupfs_error() or dedupfs_abort()
+	 */
+
+	j_errno = journal_errno(journal);
+	if (j_errno) {
+		char nbuf[16];
+
+		errstr = dedupfs_decode_error(sb, j_errno, nbuf);
+		dedupfs_warning(sb, __func__, "Filesystem error recorded "
+			     "from previous mount: %s", errstr);
+		dedupfs_warning(sb, __func__, "Marking fs in need of "
+			     "filesystem check.");
+
+		DEDUPFS_SB(sb)->s_mount_state |= DEDUPFS_ERROR_FS;
+		es->s_state |= cpu_to_le16(DEDUPFS_ERROR_FS);
+		dedupfs_commit_super (sb, es, 1);
+
+		journal_clear_err(journal);
+	}
+}
+
+/*
+ * Force the running and committing transactions to commit,
+ * and wait on the commit.
+ */
+int dedupfs_force_commit(struct super_block *sb)
+{
+	journal_t *journal;
+	int ret;
+
+	if (sb->s_flags & MS_RDONLY)
+		return 0;
+
+	journal = DEDUPFS_SB(sb)->s_journal;
+	ret = dedupfs_journal_force_commit(journal);
+	return ret;
+}
+
+static int dedupfs_sync_fs(struct super_block *sb, int wait)
+{
+	tid_t target;
+
+	if (journal_start_commit(DEDUPFS_SB(sb)->s_journal, &target)) {
+		if (wait)
+			log_wait_commit(DEDUPFS_SB(sb)->s_journal, target);
+	}
+	return 0;
+}
+
+/*
+ * LVM calls this function before a (read-only) snapshot is created.  This
+ * gives us a chance to flush the journal completely and mark the fs clean.
+ */
+static int dedupfs_freeze(struct super_block *sb)
+{
+	int error = 0;
+	journal_t *journal;
+
+	if (!(sb->s_flags & MS_RDONLY)) {
+		journal = DEDUPFS_SB(sb)->s_journal;
+
+		/* Now we set up the journal barrier. */
+		journal_lock_updates(journal);
+
+		/*
+		 * We don't want to clear needs_recovery flag when we failed
+		 * to flush the journal.
+		 */
+		error = journal_flush(journal);
+		if (error < 0)
+			goto out;
+
+		/* Journal blocked and flushed, clear needs_recovery flag. */
+		DEDUPFS_CLEAR_INCOMPAT_FEATURE(sb, DEDUPFS_FEATURE_INCOMPAT_RECOVER);
+		error = dedupfs_commit_super(sb, DEDUPFS_SB(sb)->s_es, 1);
+		if (error)
+			goto out;
+	}
+	return 0;
+
+out:
+	journal_unlock_updates(journal);
+	return error;
+}
+
+/*
+ * Called by LVM after the snapshot is done.  We need to reset the RECOVER
+ * flag here, even though the filesystem is not technically dirty yet.
+ */
+static int dedupfs_unfreeze(struct super_block *sb)
+{
+	if (!(sb->s_flags & MS_RDONLY)) {
+		lock_super(sb);
+		/* Reser the needs_recovery flag before the fs is unlocked. */
+		DEDUPFS_SET_INCOMPAT_FEATURE(sb, DEDUPFS_FEATURE_INCOMPAT_RECOVER);
+		dedupfs_commit_super(sb, DEDUPFS_SB(sb)->s_es, 1);
+		unlock_super(sb);
+		journal_unlock_updates(DEDUPFS_SB(sb)->s_journal);
+	}
+	return 0;
 }
 
 static int dedupfs_remount (struct super_block * sb, int * flags, char * data)
 {
-	struct dedupfs_sb_info * sbi = DEDUPFS_SB(sb);
 	struct dedupfs_super_block * es;
-	unsigned long old_mount_opt = sbi->s_mount_opt;
-	struct dedupfs_mount_options old_opts;
+	struct dedupfs_sb_info *sbi = DEDUPFS_SB(sb);
+	dedupfsblk_t n_blocks_count = 0;
 	unsigned long old_sb_flags;
+	struct dedupfs_mount_options old_opts;
+	int enable_quota = 0;
 	int err;
+#ifdef CONFIG_QUOTA
+	int i;
+#endif
 
-	spin_lock(&sbi->s_lock);
+	lock_kernel();
 
-	/* Store the old options */
+	/* Store the original options */
+	lock_super(sb);
 	old_sb_flags = sb->s_flags;
 	old_opts.s_mount_opt = sbi->s_mount_opt;
 	old_opts.s_resuid = sbi->s_resuid;
 	old_opts.s_resgid = sbi->s_resgid;
+	old_opts.s_commit_interval = sbi->s_commit_interval;
+#ifdef CONFIG_QUOTA
+	old_opts.s_jquota_fmt = sbi->s_jquota_fmt;
+	for (i = 0; i < MAXQUOTAS; i++)
+		old_opts.s_qf_names[i] = sbi->s_qf_names[i];
+#endif
 
 	/*
 	 * Allow the "check" option to be passed as a remount option.
 	 */
-	if (!parse_options(data, sb)) {
+	if (!parse_options(data, sb, NULL, NULL, &n_blocks_count, 1)) {
 		err = -EINVAL;
 		goto restore_opts;
 	}
+
+	if (test_opt(sb, ABORT))
+		dedupfs_abort(sb, __func__, "Abort forced by user");
 
 	sb->s_flags = (sb->s_flags & ~MS_POSIXACL) |
-		((sbi->s_mount_opt & DEDUPFS_MOUNT_POSIX_ACL) ? MS_POSIXACL : 0);
-
-	dedupfs_xip_verify_sb(sb); /* see if bdev supports xip, unset
-				    DEDUPFS_MOUNT_XIP if not */
-
-	if ((dedupfs_use_xip(sb)) && (sb->s_blocksize != PAGE_SIZE)) {
-		dedupfs_msg(sb, KERN_WARNING,
-			"warning: unsupported blocksize for xip");
-		err = -EINVAL;
-		goto restore_opts;
-	}
+		(test_opt(sb, POSIX_ACL) ? MS_POSIXACL : 0);
 
 	es = sbi->s_es;
-	if (((sbi->s_mount_opt & DEDUPFS_MOUNT_XIP) !=
-	    (old_mount_opt & DEDUPFS_MOUNT_XIP)) &&
-	    invalidate_inodes(sb)) {
-		dedupfs_msg(sb, KERN_WARNING, "warning: refusing change of "
-			 "xip flag with busy inodes while remounting");
-		sbi->s_mount_opt &= ~DEDUPFS_MOUNT_XIP;
-		sbi->s_mount_opt |= old_mount_opt & DEDUPFS_MOUNT_XIP;
-	}
-	if ((*flags & MS_RDONLY) == (sb->s_flags & MS_RDONLY)) {
-		spin_unlock(&sbi->s_lock);
-		return 0;
-	}
-	if (*flags & MS_RDONLY) {
-		if (le16_to_cpu(es->s_state) & DEDUPFS_VALID_FS ||
-		    !(sbi->s_mount_state & DEDUPFS_VALID_FS)) {
-			spin_unlock(&sbi->s_lock);
-			return 0;
-		}
 
-		/*
-		 * OK, we are remounting a valid rw partition rdonly, so set
-		 * the rdonly flag and then mark the partition as valid again.
-		 */
-		es->s_state = cpu_to_le16(sbi->s_mount_state);
-		es->s_mtime = cpu_to_le32(get_seconds());
-		spin_unlock(&sbi->s_lock);
+	dedupfs_init_journal_params(sb, sbi->s_journal);
 
-		err = dquot_suspend(sb, -1);
-		if (err < 0) {
-			spin_lock(&sbi->s_lock);
-			goto restore_opts;
-		}
-
-		dedupfs_sync_super(sb, es, 1);
-	} else {
-		__le32 ret = DEDUPFS_HAS_RO_COMPAT_FEATURE(sb,
-					       ~DEDUPFS_FEATURE_RO_COMPAT_SUPP);
-		if (ret) {
-			dedupfs_msg(sb, KERN_WARNING,
-				"warning: couldn't remount RDWR because of "
-				"unsupported optional features (%x).",
-				le32_to_cpu(ret));
+	if ((*flags & MS_RDONLY) != (sb->s_flags & MS_RDONLY) ||
+		n_blocks_count > le32_to_cpu(es->s_blocks_count)) {
+		if (test_opt(sb, ABORT)) {
 			err = -EROFS;
 			goto restore_opts;
 		}
-		/*
-		 * Mounting a RDONLY partition read-write, so reread and
-		 * store the current valid flag.  (It may have been changed
-		 * by e2fsck since we originally mounted the partition.)
-		 */
-		sbi->s_mount_state = le16_to_cpu(es->s_state);
-		if (!dedupfs_setup_super (sb, es, 0))
-			sb->s_flags &= ~MS_RDONLY;
-		spin_unlock(&sbi->s_lock);
 
-		dedupfs_write_super(sb);
+		if (*flags & MS_RDONLY) {
+			err = dquot_suspend(sb, -1);
+			if (err < 0)
+				goto restore_opts;
 
-		dquot_resume(sb, -1);
+			/*
+			 * First of all, the unconditional stuff we have to do
+			 * to disable replay of the journal when we next remount
+			 */
+			sb->s_flags |= MS_RDONLY;
+
+			/*
+			 * OK, test if we are remounting a valid rw partition
+			 * readonly, and if so set the rdonly flag and then
+			 * mark the partition as valid again.
+			 */
+			if (!(es->s_state & cpu_to_le16(DEDUPFS_VALID_FS)) &&
+			    (sbi->s_mount_state & DEDUPFS_VALID_FS))
+				es->s_state = cpu_to_le16(sbi->s_mount_state);
+
+			dedupfs_mark_recovery_complete(sb, es);
+		} else {
+			__le32 ret;
+			if ((ret = DEDUPFS_HAS_RO_COMPAT_FEATURE(sb,
+					~DEDUPFS_FEATURE_RO_COMPAT_SUPP))) {
+				dedupfs_msg(sb, KERN_WARNING,
+					"warning: couldn't remount RDWR "
+					"because of unsupported optional "
+					"features (%x)", le32_to_cpu(ret));
+				err = -EROFS;
+				goto restore_opts;
+			}
+
+			/*
+			 * If we have an unprocessed orphan list hanging
+			 * around from a previously readonly bdev mount,
+			 * require a full umount/remount for now.
+			 */
+			if (es->s_last_orphan) {
+				dedupfs_msg(sb, KERN_WARNING, "warning: couldn't "
+				       "remount RDWR because of unprocessed "
+				       "orphan inode list.  Please "
+				       "umount/remount instead.");
+				err = -EINVAL;
+				goto restore_opts;
+			}
+
+			/*
+			 * Mounting a RDONLY partition read-write, so reread
+			 * and store the current valid flag.  (It may have
+			 * been changed by e2fsck since we originally mounted
+			 * the partition.)
+			 */
+			dedupfs_clear_journal_err(sb, es);
+			sbi->s_mount_state = le16_to_cpu(es->s_state);
+			if ((err = dedupfs_group_extend(sb, es, n_blocks_count)))
+				goto restore_opts;
+			if (!dedupfs_setup_super (sb, es, 0))
+				sb->s_flags &= ~MS_RDONLY;
+			enable_quota = 1;
+		}
 	}
+#ifdef CONFIG_QUOTA
+	/* Release old quota file names */
+	for (i = 0; i < MAXQUOTAS; i++)
+		if (old_opts.s_qf_names[i] &&
+		    old_opts.s_qf_names[i] != sbi->s_qf_names[i])
+			kfree(old_opts.s_qf_names[i]);
+#endif
+	unlock_super(sb);
+	unlock_kernel();
 
+	if (enable_quota)
+		dquot_resume(sb, -1);
 	return 0;
 restore_opts:
+	sb->s_flags = old_sb_flags;
 	sbi->s_mount_opt = old_opts.s_mount_opt;
 	sbi->s_resuid = old_opts.s_resuid;
 	sbi->s_resgid = old_opts.s_resgid;
-	sb->s_flags = old_sb_flags;
-	spin_unlock(&sbi->s_lock);
+	sbi->s_commit_interval = old_opts.s_commit_interval;
+#ifdef CONFIG_QUOTA
+	sbi->s_jquota_fmt = old_opts.s_jquota_fmt;
+	for (i = 0; i < MAXQUOTAS; i++) {
+		if (sbi->s_qf_names[i] &&
+		    old_opts.s_qf_names[i] != sbi->s_qf_names[i])
+			kfree(sbi->s_qf_names[i]);
+		sbi->s_qf_names[i] = old_opts.s_qf_names[i];
+	}
+#endif
+	unlock_super(sb);
+	unlock_kernel();
 	return err;
 }
 
@@ -1296,16 +2680,15 @@ static int dedupfs_statfs (struct dentry * dentry, struct kstatfs * buf)
 	struct dedupfs_super_block *es = sbi->s_es;
 	u64 fsid;
 
-	spin_lock(&sbi->s_lock);
-
-	if (test_opt (sb, MINIX_DF))
+	if (test_opt(sb, MINIX_DF)) {
 		sbi->s_overhead_last = 0;
-	else if (sbi->s_blocks_last != le32_to_cpu(es->s_blocks_count)) {
-		unsigned long i, overhead = 0;
+	} else if (sbi->s_blocks_last != le32_to_cpu(es->s_blocks_count)) {
+		unsigned long ngroups = sbi->s_groups_count, i;
+		dedupfsblk_t overhead = 0;
 		smp_rmb();
 
 		/*
-		 * Compute the overhead (FS structures). This is constant
+		 * Compute the overhead (FS structures).  This is constant
 		 * for a given filesystem unless the number of block groups
 		 * changes so we cache the previous value until it does.
 		 */
@@ -1321,16 +2704,17 @@ static int dedupfs_statfs (struct dentry * dentry, struct kstatfs * buf)
 		 * block group descriptors.  If the sparse superblocks
 		 * feature is turned on, then not all groups have this.
 		 */
-		for (i = 0; i < sbi->s_groups_count; i++)
+		for (i = 0; i < ngroups; i++) {
 			overhead += dedupfs_bg_has_super(sb, i) +
 				dedupfs_bg_num_gdb(sb, i);
+			cond_resched();
+		}
 
 		/*
 		 * Every block group has an inode bitmap, a block
 		 * bitmap, and an inode table.
 		 */
-		overhead += (sbi->s_groups_count *
-			     (2 + sbi->s_itb_per_group));
+		overhead += ngroups * (2 + sbi->s_itb_per_group);
 		sbi->s_overhead_last = overhead;
 		smp_wmb();
 		sbi->s_blocks_last = le32_to_cpu(es->s_blocks_count);
@@ -1339,30 +2723,180 @@ static int dedupfs_statfs (struct dentry * dentry, struct kstatfs * buf)
 	buf->f_type = DEDUPFS_SUPER_MAGIC;
 	buf->f_bsize = sb->s_blocksize;
 	buf->f_blocks = le32_to_cpu(es->s_blocks_count) - sbi->s_overhead_last;
-	buf->f_bfree = dedupfs_count_free_blocks(sb);
-	es->s_free_blocks_count = cpu_to_le32(buf->f_bfree);
+	buf->f_bfree = percpu_counter_sum_positive(&sbi->s_freeblocks_counter);
 	buf->f_bavail = buf->f_bfree - le32_to_cpu(es->s_r_blocks_count);
 	if (buf->f_bfree < le32_to_cpu(es->s_r_blocks_count))
 		buf->f_bavail = 0;
 	buf->f_files = le32_to_cpu(es->s_inodes_count);
-	buf->f_ffree = dedupfs_count_free_inodes(sb);
-	es->s_free_inodes_count = cpu_to_le32(buf->f_ffree);
+	buf->f_ffree = percpu_counter_sum_positive(&sbi->s_freeinodes_counter);
 	buf->f_namelen = DEDUPFS_NAME_LEN;
 	fsid = le64_to_cpup((void *)es->s_uuid) ^
 	       le64_to_cpup((void *)es->s_uuid + sizeof(u64));
 	buf->f_fsid.val[0] = fsid & 0xFFFFFFFFUL;
 	buf->f_fsid.val[1] = (fsid >> 32) & 0xFFFFFFFFUL;
-	spin_unlock(&sbi->s_lock);
 	return 0;
 }
 
-static int dedupfs_get_sb(struct file_system_type *fs_type,
-	int flags, const char *dev_name, void *data, struct vfsmount *mnt)
-{
-	return get_sb_bdev(fs_type, flags, dev_name, data, dedupfs_fill_super, mnt);
-}
+/* Helper function for writing quotas on sync - we need to start transaction before quota file
+ * is locked for write. Otherwise the are possible deadlocks:
+ * Process 1                         Process 2
+ * dedupfs_create()                     quota_sync()
+ *   journal_start()                   write_dquot()
+ *   dquot_initialize()                       down(dqio_mutex)
+ *     down(dqio_mutex)                    journal_start()
+ *
+ */
 
 #ifdef CONFIG_QUOTA
+
+static inline struct inode *dquot_to_inode(struct dquot *dquot)
+{
+	return sb_dqopt(dquot->dq_sb)->files[dquot->dq_type];
+}
+
+static int dedupfs_write_dquot(struct dquot *dquot)
+{
+	int ret, err;
+	handle_t *handle;
+	struct inode *inode;
+
+	inode = dquot_to_inode(dquot);
+	handle = dedupfs_journal_start(inode,
+					DEDUPFS_QUOTA_TRANS_BLOCKS(dquot->dq_sb));
+	if (IS_ERR(handle))
+		return PTR_ERR(handle);
+	ret = dquot_commit(dquot);
+	err = dedupfs_journal_stop(handle);
+	if (!ret)
+		ret = err;
+	return ret;
+}
+
+static int dedupfs_acquire_dquot(struct dquot *dquot)
+{
+	int ret, err;
+	handle_t *handle;
+
+	handle = dedupfs_journal_start(dquot_to_inode(dquot),
+					DEDUPFS_QUOTA_INIT_BLOCKS(dquot->dq_sb));
+	if (IS_ERR(handle))
+		return PTR_ERR(handle);
+	ret = dquot_acquire(dquot);
+	err = dedupfs_journal_stop(handle);
+	if (!ret)
+		ret = err;
+	return ret;
+}
+
+static int dedupfs_release_dquot(struct dquot *dquot)
+{
+	int ret, err;
+	handle_t *handle;
+
+	handle = dedupfs_journal_start(dquot_to_inode(dquot),
+					DEDUPFS_QUOTA_DEL_BLOCKS(dquot->dq_sb));
+	if (IS_ERR(handle)) {
+		/* Release dquot anyway to avoid endless cycle in dqput() */
+		dquot_release(dquot);
+		return PTR_ERR(handle);
+	}
+	ret = dquot_release(dquot);
+	err = dedupfs_journal_stop(handle);
+	if (!ret)
+		ret = err;
+	return ret;
+}
+
+static int dedupfs_mark_dquot_dirty(struct dquot *dquot)
+{
+	/* Are we journaling quotas? */
+	if (DEDUPFS_SB(dquot->dq_sb)->s_qf_names[USRQUOTA] ||
+	    DEDUPFS_SB(dquot->dq_sb)->s_qf_names[GRPQUOTA]) {
+		dquot_mark_dquot_dirty(dquot);
+		return dedupfs_write_dquot(dquot);
+	} else {
+		return dquot_mark_dquot_dirty(dquot);
+	}
+}
+
+static int dedupfs_write_info(struct super_block *sb, int type)
+{
+	int ret, err;
+	handle_t *handle;
+
+	/* Data block + inode block */
+	handle = dedupfs_journal_start(sb->s_root->d_inode, 2);
+	if (IS_ERR(handle))
+		return PTR_ERR(handle);
+	ret = dquot_commit_info(sb, type);
+	err = dedupfs_journal_stop(handle);
+	if (!ret)
+		ret = err;
+	return ret;
+}
+
+/*
+ * Turn on quotas during mount time - we need to find
+ * the quota file and such...
+ */
+static int dedupfs_quota_on_mount(struct super_block *sb, int type)
+{
+	return dquot_quota_on_mount(sb, DEDUPFS_SB(sb)->s_qf_names[type],
+					DEDUPFS_SB(sb)->s_jquota_fmt, type);
+}
+
+/*
+ * Standard function to be called on quota_on
+ */
+static int dedupfs_quota_on(struct super_block *sb, int type, int format_id,
+			 char *name)
+{
+	int err;
+	struct path path;
+
+	if (!test_opt(sb, QUOTA))
+		return -EINVAL;
+
+	err = kern_path(name, LOOKUP_FOLLOW, &path);
+	if (err)
+		return err;
+
+	/* Quotafile not on the same filesystem? */
+	if (path.mnt->mnt_sb != sb) {
+		path_put(&path);
+		return -EXDEV;
+	}
+	/* Journaling quota? */
+	if (DEDUPFS_SB(sb)->s_qf_names[type]) {
+		/* Quotafile not of fs root? */
+		if (path.dentry->d_parent != sb->s_root)
+			dedupfs_msg(sb, KERN_WARNING,
+				"warning: Quota file not on filesystem root. "
+				"Journaled quota will not work.");
+	}
+
+	/*
+	 * When we journal data on quota file, we have to flush journal to see
+	 * all updates to the file when we bypass pagecache...
+	 */
+	if (dedupfs_should_journal_data(path.dentry->d_inode)) {
+		/*
+		 * We don't need to lock updates but journal_flush() could
+		 * otherwise be livelocked...
+		 */
+		journal_lock_updates(DEDUPFS_SB(sb)->s_journal);
+		err = journal_flush(DEDUPFS_SB(sb)->s_journal);
+		journal_unlock_updates(DEDUPFS_SB(sb)->s_journal);
+		if (err) {
+			path_put(&path);
+			return err;
+		}
+	}
+
+	err = dquot_quota_on_path(sb, type, format_id, &path);
+	path_put(&path);
+	return err;
+}
 
 /* Read data from quotafile - avoid pagecache and such because we cannot afford
  * acquiring the locks... As quota files are never truncated and quota code
@@ -1377,7 +2911,6 @@ static ssize_t dedupfs_quota_read(struct super_block *sb, int type, char *data,
 	int offset = off & (sb->s_blocksize - 1);
 	int tocopy;
 	size_t toread;
-	struct buffer_head tmp_bh;
 	struct buffer_head *bh;
 	loff_t i_size = i_size_read(inode);
 
@@ -1389,21 +2922,14 @@ static ssize_t dedupfs_quota_read(struct super_block *sb, int type, char *data,
 	while (toread > 0) {
 		tocopy = sb->s_blocksize - offset < toread ?
 				sb->s_blocksize - offset : toread;
-
-		tmp_bh.b_state = 0;
-		tmp_bh.b_size = sb->s_blocksize;
-		err = dedupfs_get_block(inode, blk, &tmp_bh, 0);
-		if (err < 0)
+		bh = dedupfs_bread(NULL, inode, blk, 0, &err);
+		if (err)
 			return err;
-		if (!buffer_mapped(&tmp_bh))	/* A hole? */
+		if (!bh)	/* A hole? */
 			memset(data, 0, tocopy);
-		else {
-			bh = sb_bread(sb, tmp_bh.b_blocknr);
-			if (!bh)
-				return -EIO;
+		else
 			memcpy(data, bh->b_data+offset, tocopy);
-			brelse(bh);
-		}
+		brelse(bh);
 		offset = 0;
 		toread -= tocopy;
 		data += tocopy;
@@ -1412,7 +2938,8 @@ static ssize_t dedupfs_quota_read(struct super_block *sb, int type, char *data,
 	return len;
 }
 
-/* Write to quotafile */
+/* Write to quotafile (we know the transaction is already started and has
+ * enough credits) */
 static ssize_t dedupfs_quota_write(struct super_block *sb, int type,
 				const char *data, size_t len, loff_t off)
 {
@@ -1420,57 +2947,76 @@ static ssize_t dedupfs_quota_write(struct super_block *sb, int type,
 	sector_t blk = off >> DEDUPFS_BLOCK_SIZE_BITS(sb);
 	int err = 0;
 	int offset = off & (sb->s_blocksize - 1);
-	int tocopy;
-	size_t towrite = len;
-	struct buffer_head tmp_bh;
+	int journal_quota = DEDUPFS_SB(sb)->s_qf_names[type] != NULL;
 	struct buffer_head *bh;
+	handle_t *handle = journal_current_handle();
 
+	if (!handle) {
+		dedupfs_msg(sb, KERN_WARNING,
+			"warning: quota write (off=%llu, len=%llu)"
+			" cancelled because transaction is not started.",
+			(unsigned long long)off, (unsigned long long)len);
+		return -EIO;
+	}
+
+	/*
+	 * Since we account only one data block in transaction credits,
+	 * then it is impossible to cross a block boundary.
+	 */
+	if (sb->s_blocksize - offset < len) {
+		dedupfs_msg(sb, KERN_WARNING, "Quota write (off=%llu, len=%llu)"
+			" cancelled because not block aligned",
+			(unsigned long long)off, (unsigned long long)len);
+		return -EIO;
+	}
 	mutex_lock_nested(&inode->i_mutex, I_MUTEX_QUOTA);
-	while (towrite > 0) {
-		tocopy = sb->s_blocksize - offset < towrite ?
-				sb->s_blocksize - offset : towrite;
-
-		tmp_bh.b_state = 0;
-		err = dedupfs_get_block(inode, blk, &tmp_bh, 1);
-		if (err < 0)
-			goto out;
-		if (offset || tocopy != DEDUPFS_BLOCK_SIZE(sb))
-			bh = sb_bread(sb, tmp_bh.b_blocknr);
-		else
-			bh = sb_getblk(sb, tmp_bh.b_blocknr);
-		if (!bh) {
-			err = -EIO;
+	bh = dedupfs_bread(handle, inode, blk, 1, &err);
+	if (!bh)
+		goto out;
+	if (journal_quota) {
+		err = dedupfs_journal_get_write_access(handle, bh);
+		if (err) {
+			brelse(bh);
 			goto out;
 		}
-		lock_buffer(bh);
-		memcpy(bh->b_data+offset, data, tocopy);
-		flush_dcache_page(bh->b_page);
-		set_buffer_uptodate(bh);
-		mark_buffer_dirty(bh);
-		unlock_buffer(bh);
-		brelse(bh);
-		offset = 0;
-		towrite -= tocopy;
-		data += tocopy;
-		blk++;
 	}
+	lock_buffer(bh);
+	memcpy(bh->b_data+offset, data, len);
+	flush_dcache_page(bh->b_page);
+	unlock_buffer(bh);
+	if (journal_quota)
+		err = dedupfs_journal_dirty_metadata(handle, bh);
+	else {
+		/* Always do at least ordered writes for quotas */
+		err = dedupfs_journal_dirty_data(handle, bh);
+		mark_buffer_dirty(bh);
+	}
+	brelse(bh);
 out:
-	if (len == towrite) {
+	if (err) {
 		mutex_unlock(&inode->i_mutex);
 		return err;
 	}
-	if (inode->i_size < off+len-towrite)
-		i_size_write(inode, off+len-towrite);
+	if (inode->i_size < off + len) {
+		i_size_write(inode, off + len);
+		DEDUPFS_I(inode)->i_disksize = inode->i_size;
+	}
 	inode->i_version++;
 	inode->i_mtime = inode->i_ctime = CURRENT_TIME;
-	mark_inode_dirty(inode);
+	dedupfs_mark_inode_dirty(handle, inode);
 	mutex_unlock(&inode->i_mutex);
-	return len - towrite;
+	return len;
 }
 
 #endif
 
-static struct file_system_type dedupfs_fs_type = {
+static int dedupfs_get_sb(struct file_system_type *fs_type,
+	int flags, const char *dev_name, void *data, struct vfsmount *mnt)
+{
+	return get_sb_bdev(fs_type, flags, dev_name, data, dedupfs_fill_super, mnt);
+}
+
+static struct file_system_type dedupfs_type = {
 	.owner		= THIS_MODULE,
 	.name		= "dedupfs",
 	.get_sb		= dedupfs_get_sb,
@@ -1478,7 +3024,7 @@ static struct file_system_type dedupfs_fs_type = {
 	.fs_flags	= FS_REQUIRES_DEV,
 };
 
-static int __init init_dedupfs_fs(void)
+static int __init init_dedupfs(void)
 {
 	int err = init_dedupfs_xattr();
 	if (err)
@@ -1486,7 +3032,7 @@ static int __init init_dedupfs_fs(void)
 	err = init_inodecache();
 	if (err)
 		goto out1;
-        err = register_filesystem(&dedupfs_fs_type);
+        err = register_filesystem(&dedupfs_type);
 	if (err)
 		goto out;
 	return 0;
@@ -1497,12 +3043,15 @@ out1:
 	return err;
 }
 
-static void __exit exit_dedupfs_fs(void)
+static void __exit exit_dedupfs(void)
 {
-	unregister_filesystem(&dedupfs_fs_type);
+	unregister_filesystem(&dedupfs_type);
 	destroy_inodecache();
 	exit_dedupfs_xattr();
 }
 
-module_init(init_dedupfs_fs)
-module_exit(exit_dedupfs_fs)
+MODULE_AUTHOR("Remy Card, Stephen Tweedie, Andrew Morton, Andreas Dilger, Theodore Ts'o and others");
+MODULE_DESCRIPTION("Second Extended Filesystem with journaling extensions");
+MODULE_LICENSE("GPL");
+module_init(init_dedupfs)
+module_exit(exit_dedupfs)

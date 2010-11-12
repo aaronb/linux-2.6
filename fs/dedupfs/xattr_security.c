@@ -7,7 +7,8 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/fs.h>
-#include <linux/dedupfs_fs.h>
+#include "dedupfs_jbd.h"
+#include "dedupfs.h"
 #include <linux/security.h>
 #include "xattr.h"
 
@@ -15,8 +16,9 @@ static size_t
 dedupfs_xattr_security_list(struct dentry *dentry, char *list, size_t list_size,
 			 const char *name, size_t name_len, int type)
 {
-	const int prefix_len = XATTR_SECURITY_PREFIX_LEN;
+	const size_t prefix_len = XATTR_SECURITY_PREFIX_LEN;
 	const size_t total_len = prefix_len + name_len + 1;
+
 
 	if (list && total_len <= list_size) {
 		memcpy(list, XATTR_SECURITY_PREFIX, prefix_len);
@@ -28,12 +30,12 @@ dedupfs_xattr_security_list(struct dentry *dentry, char *list, size_t list_size,
 
 static int
 dedupfs_xattr_security_get(struct dentry *dentry, const char *name,
-		       void *buffer, size_t size, int type)
+		void *buffer, size_t size, int type)
 {
 	if (strcmp(name, "") == 0)
 		return -EINVAL;
-	return dedupfs_xattr_get(dentry->d_inode, EXT2_XATTR_INDEX_SECURITY, name,
-			      buffer, size);
+	return dedupfs_xattr_get(dentry->d_inode, DEDUPFS_XATTR_INDEX_SECURITY,
+			      name, buffer, size);
 }
 
 static int
@@ -42,12 +44,12 @@ dedupfs_xattr_security_set(struct dentry *dentry, const char *name,
 {
 	if (strcmp(name, "") == 0)
 		return -EINVAL;
-	return dedupfs_xattr_set(dentry->d_inode, EXT2_XATTR_INDEX_SECURITY, name,
-			      value, size, flags);
+	return dedupfs_xattr_set(dentry->d_inode, DEDUPFS_XATTR_INDEX_SECURITY,
+			      name, value, size, flags);
 }
 
 int
-dedupfs_init_security(struct inode *inode, struct inode *dir)
+dedupfs_init_security(handle_t *handle, struct inode *inode, struct inode *dir)
 {
 	int err;
 	size_t len;
@@ -60,8 +62,8 @@ dedupfs_init_security(struct inode *inode, struct inode *dir)
 			return 0;
 		return err;
 	}
-	err = dedupfs_xattr_set(inode, EXT2_XATTR_INDEX_SECURITY,
-			     name, value, len, 0);
+	err = dedupfs_xattr_set_handle(handle, inode, DEDUPFS_XATTR_INDEX_SECURITY,
+				    name, value, len, 0);
 	kfree(name);
 	kfree(value);
 	return err;

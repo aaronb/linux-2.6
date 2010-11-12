@@ -11,12 +11,15 @@
  *        David S. Miller (davem@caip.rutgers.edu), 1995
  */
 
-#include "dedupfs.h"
-#include <linux/quotaops.h>
-#include <linux/slab.h>
-#include <linux/sched.h>
-#include <linux/buffer_head.h>
+#include <linux/time.h>
 #include <linux/capability.h>
+#include <linux/fs.h>
+#include <linux/slab.h>
+#include <linux/jbd.h>
+#include "dedupfs.h"
+#include "dedupfs_jbd.h"
+#include <linux/quotaops.h>
+#include <linux/buffer_head.h>
 
 /*
  * balloc.c contains the blocks allocation and deallocation routines
@@ -36,6 +39,13 @@
 
 #define in_range(b, first, len)	((b) >= (first) && (b) <= (first) + (len) - 1)
 
+/**
+ * dedupfs_get_group_desc() -- load group descriptor from disk
+ * @sb:			super block
+ * @block_group:	given block group
+ * @bh:			pointer to the buffer head to store the block
+ *			group descriptor
+ */
 struct dedupfs_group_desc * dedupfs_get_group_desc(struct super_block * sb,
 					     unsigned int block_group,
 					     struct buffer_head ** bh)
@@ -53,6 +63,7 @@ struct dedupfs_group_desc * dedupfs_get_group_desc(struct super_block * sb,
 
 		return NULL;
 	}
+	smp_rmb();
 
 	group_desc = block_group >> DEDUPFS_DESC_PER_BLOCK_BITS(sb);
 	offset = block_group & (DEDUPFS_DESC_PER_BLOCK(sb) - 1);
@@ -77,8 +88,8 @@ static int dedupfs_valid_block_bitmap(struct super_block *sb,
 {
 	dedupfs_grpblk_t offset;
 	dedupfs_grpblk_t next_zero_bit;
-	dedupfs_fsblk_t bitmap_blk;
-	dedupfs_fsblk_t group_first_block;
+	dedupfsblk_t bitmap_blk;
+	dedupfsblk_t group_first_block;
 
 	group_first_block = dedupfs_group_first_block_no(sb, block_group);
 
@@ -114,7 +125,11 @@ err_out:
 	return 0;
 }
 
-/*
+/**
+ * read_block_bitmap()
+ * @sb:			super block
+ * @block_group:	given block group
+ *
  * Read the bitmap for a given block_group,and validate the
  * bits for block/inode/inode tables are set in the bitmaps
  *
@@ -125,7 +140,7 @@ read_block_bitmap(struct super_block *sb, unsigned int block_group)
 {
 	struct dedupfs_group_desc * desc;
 	struct buffer_head * bh = NULL;
-	dedupfs_fsblk_t bitmap_blk;
+	dedupfsblk_t bitmap_blk;
 
 	desc = dedupfs_get_group_desc(sb, block_group, NULL);
 	if (!desc)
@@ -150,7 +165,6 @@ read_block_bitmap(struct super_block *sb, unsigned int block_group)
 			    block_group, le32_to_cpu(desc->bg_block_bitmap));
 		return NULL;
 	}
-
 	dedupfs_valid_block_bitmap(sb, desc, block_group, bh);
 	/*
 	 * file system mounted not to panic on error, continue with corrupt
@@ -158,33 +172,6 @@ read_block_bitmap(struct super_block *sb, unsigned int block_group)
 	 */
 	return bh;
 }
-
-static void release_blocks(struct super_block *sb, int count)
-{
-	if (count) {
-		struct dedupfs_sb_info *sbi = DEDUPFS_SB(sb);
-
-		percpu_counter_add(&sbi->s_freeblocks_counter, count);
-		sb->s_dirt = 1;
-	}
-}
-
-static void group_adjust_blocks(struct super_block *sb, int group_no,
-	struct dedupfs_group_desc *desc, struct buffer_head *bh, int count)
-{
-	if (count) {
-		struct dedupfs_sb_info *sbi = DEDUPFS_SB(sb);
-		unsigned free_blocks;
-
-		spin_lock(sb_bgl_lock(sbi, group_no));
-		free_blocks = le16_to_cpu(desc->bg_free_blocks_count);
-		desc->bg_free_blocks_count = cpu_to_le16(free_blocks + count);
-		spin_unlock(sb_bgl_lock(sbi, group_no));
-		sb->s_dirt = 1;
-		mark_buffer_dirty(bh);
-	}
-}
-
 /*
  * The reservation window structure operations
  * --------------------------------------------
@@ -203,7 +190,7 @@ static void group_adjust_blocks(struct super_block *sb, int group_no,
  * @fn:			function which wishes to dump the reservation map
  *
  * If verbose is turned on, it will print the whole block reservation
- * windows(start, end). Otherwise, it will only print out the "bad" windows,
+ * windows(start, end).	Otherwise, it will only print out the "bad" windows,
  * those windows that overlap with their immediate neighbors.
  */
 #if 1
@@ -224,8 +211,8 @@ restart:
 		rsv = rb_entry(n, struct dedupfs_reserve_window_node, rsv_node);
 		if (verbose)
 			printk("reservation window 0x%p "
-				"start: %lu, end: %lu\n",
-				rsv, rsv->rsv_start, rsv->rsv_end);
+			       "start:  %lu, end:  %lu\n",
+			       rsv, rsv->rsv_start, rsv->rsv_end);
 		if (rsv->rsv_start && rsv->rsv_start >= rsv->rsv_end) {
 			printk("Bad reservation %p (start >= end)\n",
 			       rsv);
@@ -275,10 +262,10 @@ static int
 goal_in_my_reservation(struct dedupfs_reserve_window *rsv, dedupfs_grpblk_t grp_goal,
 			unsigned int group, struct super_block * sb)
 {
-	dedupfs_fsblk_t group_first_block, group_last_block;
+	dedupfsblk_t group_first_block, group_last_block;
 
 	group_first_block = dedupfs_group_first_block_no(sb, group);
-	group_last_block = group_first_block + DEDUPFS_BLOCKS_PER_GROUP(sb) - 1;
+	group_last_block = group_first_block + (DEDUPFS_BLOCKS_PER_GROUP(sb) - 1);
 
 	if ((rsv->_rsv_start > group_last_block) ||
 	    (rsv->_rsv_end < group_first_block))
@@ -299,7 +286,7 @@ goal_in_my_reservation(struct dedupfs_reserve_window *rsv, dedupfs_grpblk_t grp_
  * Returns NULL if there are no windows or if all windows start after the goal.
  */
 static struct dedupfs_reserve_window_node *
-search_reserve_window(struct rb_root *root, dedupfs_fsblk_t goal)
+search_reserve_window(struct rb_root *root, dedupfsblk_t goal)
 {
 	struct rb_node *n = root->rb_node;
 	struct dedupfs_reserve_window_node *rsv;
@@ -330,19 +317,19 @@ search_reserve_window(struct rb_root *root, dedupfs_fsblk_t goal)
 	return rsv;
 }
 
-/*
+/**
  * dedupfs_rsv_window_add() -- Insert a window to the block reservation rb tree.
  * @sb:			super block
  * @rsv:		reservation window to add
  *
- * Must be called with rsv_lock held.
+ * Must be called with rsv_lock hold.
  */
 void dedupfs_rsv_window_add(struct super_block *sb,
 		    struct dedupfs_reserve_window_node *rsv)
 {
 	struct rb_root *root = &DEDUPFS_SB(sb)->s_rsv_window_root;
 	struct rb_node *node = &rsv->rsv_node;
-	dedupfs_fsblk_t start = rsv->rsv_start;
+	dedupfsblk_t start = rsv->rsv_start;
 
 	struct rb_node ** p = &root->rb_node;
 	struct rb_node * parent = NULL;
@@ -368,13 +355,13 @@ void dedupfs_rsv_window_add(struct super_block *sb,
 }
 
 /**
- * rsv_window_remove() -- unlink a window from the reservation rb tree
+ * dedupfs_rsv_window_remove() -- unlink a window from the reservation rb tree
  * @sb:			super block
  * @rsv:		reservation window to remove
  *
  * Mark the block reservation window as not allocated, and unlink it
  * from the filesystem reservation window rb tree. Must be called with
- * rsv_lock held.
+ * rsv_lock hold.
  */
 static void rsv_window_remove(struct super_block *sb,
 			      struct dedupfs_reserve_window_node *rsv)
@@ -394,14 +381,14 @@ static void rsv_window_remove(struct super_block *sb,
 static inline int rsv_is_empty(struct dedupfs_reserve_window *rsv)
 {
 	/* a valid reservation end block could not be 0 */
-	return (rsv->_rsv_end == DEDUPFS_RESERVE_WINDOW_NOT_ALLOCATED);
+	return rsv->_rsv_end == DEDUPFS_RESERVE_WINDOW_NOT_ALLOCATED;
 }
 
 /**
  * dedupfs_init_block_alloc_info()
  * @inode:		file inode structure
  *
- * Allocate and initialize the  reservation window structure, and
+ * Allocate and initialize the	reservation window structure, and
  * link the window to the dedupfs inode structure at last
  *
  * The reservation window structure is only dynamically allocated
@@ -416,7 +403,7 @@ static inline int rsv_is_empty(struct dedupfs_reserve_window *rsv)
  * when setting the reservation window size through ioctl before the file
  * is open for write (needs block allocation).
  *
- * Needs truncate_mutex protection prior to calling this function.
+ * Needs truncate_mutex protection prior to call this function.
  */
 void dedupfs_init_block_alloc_info(struct inode *inode)
 {
@@ -431,7 +418,7 @@ void dedupfs_init_block_alloc_info(struct inode *inode)
 		rsv->rsv_start = DEDUPFS_RESERVE_WINDOW_NOT_ALLOCATED;
 		rsv->rsv_end = DEDUPFS_RESERVE_WINDOW_NOT_ALLOCATED;
 
-	 	/*
+		/*
 		 * if filesystem is mounted with NORESERVATION, the goal
 		 * reservation window size is set to zero to indicate
 		 * block reservation is off
@@ -455,9 +442,10 @@ void dedupfs_init_block_alloc_info(struct inode *inode)
  * or at last iput().
  *
  * It is being called in three cases:
- * 	dedupfs_release_file(): last writer closes the file
- * 	dedupfs_clear_inode(): last iput(), when nobody links to this file.
- * 	dedupfs_truncate(): when the block indirect map is about to change.
+ *	dedupfs_release_file(): last writer close the file
+ *	dedupfs_clear_inode(): last iput(), when nobody link to this file.
+ *	dedupfs_truncate(): when the block indirect map is about to change.
+ *
  */
 void dedupfs_discard_reservation(struct inode *inode)
 {
@@ -479,32 +467,38 @@ void dedupfs_discard_reservation(struct inode *inode)
 }
 
 /**
- * dedupfs_free_blocks_sb() -- Free given blocks and update quota and i_blocks
- * @inode:		inode
- * @block:		start physcial block to free
- * @count:		number of blocks to free
+ * dedupfs_free_blocks_sb() -- Free given blocks and update quota
+ * @handle:			handle to this transaction
+ * @sb:				super block
+ * @block:			start physcial block to free
+ * @count:			number of blocks to free
+ * @pdquot_freed_blocks:	pointer to quota
  */
-void dedupfs_free_blocks (struct inode * inode, unsigned long block,
-		       unsigned long count)
+void dedupfs_free_blocks_sb(handle_t *handle, struct super_block *sb,
+			 dedupfsblk_t block, unsigned long count,
+			 unsigned long *pdquot_freed_blocks)
 {
 	struct buffer_head *bitmap_bh = NULL;
-	struct buffer_head * bh2;
+	struct buffer_head *gd_bh;
 	unsigned long block_group;
-	unsigned long bit;
+	dedupfs_grpblk_t bit;
 	unsigned long i;
 	unsigned long overflow;
-	struct super_block * sb = inode->i_sb;
-	struct dedupfs_sb_info * sbi = DEDUPFS_SB(sb);
 	struct dedupfs_group_desc * desc;
-	struct dedupfs_super_block * es = sbi->s_es;
-	unsigned freed = 0, group_freed;
+	struct dedupfs_super_block * es;
+	struct dedupfs_sb_info *sbi;
+	int err = 0, ret;
+	dedupfs_grpblk_t group_freed;
 
+	*pdquot_freed_blocks = 0;
+	sbi = DEDUPFS_SB(sb);
+	es = sbi->s_es;
 	if (block < le32_to_cpu(es->s_first_data_block) ||
 	    block + count < block ||
 	    block + count > le32_to_cpu(es->s_blocks_count)) {
 		dedupfs_error (sb, "dedupfs_free_blocks",
 			    "Freeing blocks not in datazone - "
-			    "block = %lu, count = %lu", block, count);
+			    "block = "E3FSBLK", count = %lu", block, count);
 		goto error_return;
 	}
 
@@ -528,8 +522,7 @@ do_more:
 	bitmap_bh = read_block_bitmap(sb, block_group);
 	if (!bitmap_bh)
 		goto error_return;
-
-	desc = dedupfs_get_group_desc (sb, block_group, &bh2);
+	desc = dedupfs_get_group_desc (sb, block_group, &gd_bh);
 	if (!desc)
 		goto error_return;
 
@@ -541,37 +534,188 @@ do_more:
 		      sbi->s_itb_per_group)) {
 		dedupfs_error (sb, "dedupfs_free_blocks",
 			    "Freeing blocks in system zones - "
-			    "Block = %lu, count = %lu",
+			    "Block = "E3FSBLK", count = %lu",
 			    block, count);
 		goto error_return;
 	}
 
+	/*
+	 * We are about to start releasing blocks in the bitmap,
+	 * so we need undo access.
+	 */
+	/* @@@ check errors */
+	BUFFER_TRACE(bitmap_bh, "getting undo access");
+	err = dedupfs_journal_get_undo_access(handle, bitmap_bh);
+	if (err)
+		goto error_return;
+
+	/*
+	 * We are about to modify some metadata.  Call the journal APIs
+	 * to unshare ->b_data if a currently-committing transaction is
+	 * using it
+	 */
+	BUFFER_TRACE(gd_bh, "get_write_access");
+	err = dedupfs_journal_get_write_access(handle, gd_bh);
+	if (err)
+		goto error_return;
+
+	jbd_lock_bh_state(bitmap_bh);
+
 	for (i = 0, group_freed = 0; i < count; i++) {
+		/*
+		 * An HJ special.  This is expensive...
+		 */
+#ifdef CONFIG_JBD_DEBUG
+		jbd_unlock_bh_state(bitmap_bh);
+		{
+			struct buffer_head *debug_bh;
+			debug_bh = sb_find_get_block(sb, block + i);
+			if (debug_bh) {
+				BUFFER_TRACE(debug_bh, "Deleted!");
+				if (!bh2jh(bitmap_bh)->b_committed_data)
+					BUFFER_TRACE(debug_bh,
+						"No commited data in bitmap");
+				BUFFER_TRACE2(debug_bh, bitmap_bh, "bitmap");
+				__brelse(debug_bh);
+			}
+		}
+		jbd_lock_bh_state(bitmap_bh);
+#endif
+		if (need_resched()) {
+			jbd_unlock_bh_state(bitmap_bh);
+			cond_resched();
+			jbd_lock_bh_state(bitmap_bh);
+		}
+		/* @@@ This prevents newly-allocated data from being
+		 * freed and then reallocated within the same
+		 * transaction.
+		 *
+		 * Ideally we would want to allow that to happen, but to
+		 * do so requires making journal_forget() capable of
+		 * revoking the queued write of a data block, which
+		 * implies blocking on the journal lock.  *forget()
+		 * cannot block due to truncate races.
+		 *
+		 * Eventually we can fix this by making journal_forget()
+		 * return a status indicating whether or not it was able
+		 * to revoke the buffer.  On successful revoke, it is
+		 * safe not to set the allocation bit in the committed
+		 * bitmap, because we know that there is no outstanding
+		 * activity on the buffer any more and so it is safe to
+		 * reallocate it.
+		 */
+		BUFFER_TRACE(bitmap_bh, "set in b_committed_data");
+		J_ASSERT_BH(bitmap_bh,
+				bh2jh(bitmap_bh)->b_committed_data != NULL);
+		dedupfs_set_bit_atomic(sb_bgl_lock(sbi, block_group), bit + i,
+				bh2jh(bitmap_bh)->b_committed_data);
+
+		/*
+		 * We clear the bit in the bitmap after setting the committed
+		 * data bit, because this is the reverse order to that which
+		 * the allocator uses.
+		 */
+		BUFFER_TRACE(bitmap_bh, "clear bit");
 		if (!dedupfs_clear_bit_atomic(sb_bgl_lock(sbi, block_group),
 						bit + i, bitmap_bh->b_data)) {
+			jbd_unlock_bh_state(bitmap_bh);
 			dedupfs_error(sb, __func__,
-				"bit already cleared for block %lu", block + i);
+				"bit already cleared for block "E3FSBLK,
+				 block + i);
+			jbd_lock_bh_state(bitmap_bh);
+			BUFFER_TRACE(bitmap_bh, "bit already cleared");
 		} else {
 			group_freed++;
 		}
 	}
+	jbd_unlock_bh_state(bitmap_bh);
 
-	mark_buffer_dirty(bitmap_bh);
-	if (sb->s_flags & MS_SYNCHRONOUS)
-		sync_dirty_buffer(bitmap_bh);
+	spin_lock(sb_bgl_lock(sbi, block_group));
+	le16_add_cpu(&desc->bg_free_blocks_count, group_freed);
+	spin_unlock(sb_bgl_lock(sbi, block_group));
+	percpu_counter_add(&sbi->s_freeblocks_counter, count);
 
-	group_adjust_blocks(sb, block_group, desc, bh2, group_freed);
-	freed += group_freed;
+	/* We dirtied the bitmap block */
+	BUFFER_TRACE(bitmap_bh, "dirtied bitmap block");
+	err = dedupfs_journal_dirty_metadata(handle, bitmap_bh);
 
-	if (overflow) {
+	/* And the group descriptor block */
+	BUFFER_TRACE(gd_bh, "dirtied group descriptor block");
+	ret = dedupfs_journal_dirty_metadata(handle, gd_bh);
+	if (!err) err = ret;
+	*pdquot_freed_blocks += group_freed;
+
+	if (overflow && !err) {
 		block += count;
 		count = overflow;
 		goto do_more;
 	}
+
 error_return:
 	brelse(bitmap_bh);
-	release_blocks(sb, freed);
-	dquot_free_block_nodirty(inode, freed);
+	dedupfs_std_error(sb, err);
+	return;
+}
+
+/**
+ * dedupfs_free_blocks() -- Free given blocks and update quota
+ * @handle:		handle for this transaction
+ * @inode:		inode
+ * @block:		start physical block to free
+ * @count:		number of blocks to count
+ */
+void dedupfs_free_blocks(handle_t *handle, struct inode *inode,
+			dedupfsblk_t block, unsigned long count)
+{
+	struct super_block * sb;
+	unsigned long dquot_freed_blocks;
+
+	sb = inode->i_sb;
+	if (!sb) {
+		printk ("dedupfs_free_blocks: nonexistent device");
+		return;
+	}
+	dedupfs_free_blocks_sb(handle, sb, block, count, &dquot_freed_blocks);
+	if (dquot_freed_blocks)
+		dquot_free_block(inode, dquot_freed_blocks);
+	return;
+}
+
+/**
+ * dedupfs_test_allocatable()
+ * @nr:			given allocation block group
+ * @bh:			bufferhead contains the bitmap of the given block group
+ *
+ * For dedupfs allocations, we must not reuse any blocks which are
+ * allocated in the bitmap buffer's "last committed data" copy.  This
+ * prevents deletes from freeing up the page for reuse until we have
+ * committed the delete transaction.
+ *
+ * If we didn't do this, then deleting something and reallocating it as
+ * data would allow the old block to be overwritten before the
+ * transaction committed (because we force data to disk before commit).
+ * This would lead to corruption if we crashed between overwriting the
+ * data and committing the delete.
+ *
+ * @@@ We may want to make this allocation behaviour conditional on
+ * data-writes at some point, and disable it for metadata allocations or
+ * sync-data inodes.
+ */
+static int dedupfs_test_allocatable(dedupfs_grpblk_t nr, struct buffer_head *bh)
+{
+	int ret;
+	struct journal_head *jh = bh2jh(bh);
+
+	if (dedupfs_test_bit(nr, bh->b_data))
+		return 0;
+
+	jbd_lock_bh_state(bh);
+	if (!jh->b_committed_data)
+		ret = 1;
+	else
+		ret = !dedupfs_test_bit(nr, jh->b_committed_data);
+	jbd_unlock_bh_state(bh);
+	return ret;
 }
 
 /**
@@ -580,42 +724,55 @@ error_return:
  * @bh:			bufferhead contains the block group bitmap
  * @maxblocks:		the ending block (group relative) of the reservation
  *
- * The bitmap search --- search forward through the actual bitmap on disk until
- * we find a bit free.
+ * The bitmap search --- search forward alternately through the actual
+ * bitmap on disk and the last-committed copy in journal, until we find a
+ * bit free in both bitmaps.
  */
 static dedupfs_grpblk_t
 bitmap_search_next_usable_block(dedupfs_grpblk_t start, struct buffer_head *bh,
 					dedupfs_grpblk_t maxblocks)
 {
 	dedupfs_grpblk_t next;
+	struct journal_head *jh = bh2jh(bh);
 
-	next = dedupfs_find_next_zero_bit(bh->b_data, maxblocks, start);
-	if (next >= maxblocks)
-		return -1;
-	return next;
+	while (start < maxblocks) {
+		next = dedupfs_find_next_zero_bit(bh->b_data, maxblocks, start);
+		if (next >= maxblocks)
+			return -1;
+		if (dedupfs_test_allocatable(next, bh))
+			return next;
+		jbd_lock_bh_state(bh);
+		if (jh->b_committed_data)
+			start = dedupfs_find_next_zero_bit(jh->b_committed_data,
+							maxblocks, next);
+		jbd_unlock_bh_state(bh);
+	}
+	return -1;
 }
 
 /**
  * find_next_usable_block()
  * @start:		the starting block (group relative) to find next
- * 			allocatable block in bitmap.
+ *			allocatable block in bitmap.
  * @bh:			bufferhead contains the block group bitmap
  * @maxblocks:		the ending block (group relative) for the search
  *
- * Find an allocatable block in a bitmap.  We perform the "most
+ * Find an allocatable block in a bitmap.  We honor both the bitmap and
+ * its last-committed copy (if that exists), and perform the "most
  * appropriate allocation" algorithm of looking for a free block near
- * the initial goal; then for a free byte somewhere in the bitmap;
- * then for any free bit in the bitmap.
+ * the initial goal; then for a free byte somewhere in the bitmap; then
+ * for any free bit in the bitmap.
  */
 static dedupfs_grpblk_t
-find_next_usable_block(int start, struct buffer_head *bh, int maxblocks)
+find_next_usable_block(dedupfs_grpblk_t start, struct buffer_head *bh,
+			dedupfs_grpblk_t maxblocks)
 {
 	dedupfs_grpblk_t here, next;
 	char *p, *r;
 
 	if (start > 0) {
 		/*
-		 * The goal was occupied; search forward for a free 
+		 * The goal was occupied; search forward for a free
 		 * block within the next XX blocks.
 		 *
 		 * end_goal is more or less random, but it has to be
@@ -626,7 +783,7 @@ find_next_usable_block(int start, struct buffer_head *bh, int maxblocks)
 		if (end_goal > maxblocks)
 			end_goal = maxblocks;
 		here = dedupfs_find_next_zero_bit(bh->b_data, end_goal, start);
-		if (here < end_goal)
+		if (here < end_goal && dedupfs_test_allocatable(here, bh))
 			return here;
 		dedupfs_debug("Bit not found near goal\n");
 	}
@@ -639,14 +796,49 @@ find_next_usable_block(int start, struct buffer_head *bh, int maxblocks)
 	r = memscan(p, 0, ((maxblocks + 7) >> 3) - (here >> 3));
 	next = (r - ((char *)bh->b_data)) << 3;
 
-	if (next < maxblocks && next >= here)
+	if (next < maxblocks && next >= start && dedupfs_test_allocatable(next, bh))
 		return next;
 
+	/*
+	 * The bitmap search --- search forward alternately through the actual
+	 * bitmap and the last-committed copy until we find a bit free in
+	 * both
+	 */
 	here = bitmap_search_next_usable_block(here, bh, maxblocks);
 	return here;
 }
 
-/*
+/**
+ * claim_block()
+ * @block:		the free block (group relative) to allocate
+ * @bh:			the bufferhead containts the block group bitmap
+ *
+ * We think we can allocate this block in this bitmap.  Try to set the bit.
+ * If that succeeds then check that nobody has allocated and then freed the
+ * block since we saw that is was not marked in b_committed_data.  If it _was_
+ * allocated and freed then clear the bit in the bitmap again and return
+ * zero (failure).
+ */
+static inline int
+claim_block(spinlock_t *lock, dedupfs_grpblk_t block, struct buffer_head *bh)
+{
+	struct journal_head *jh = bh2jh(bh);
+	int ret;
+
+	if (dedupfs_set_bit_atomic(lock, block, bh->b_data))
+		return 0;
+	jbd_lock_bh_state(bh);
+	if (jh->b_committed_data && dedupfs_test_bit(block,jh->b_committed_data)) {
+		dedupfs_clear_bit_atomic(lock, block, bh->b_data);
+		ret = 0;
+	} else {
+		ret = 1;
+	}
+	jbd_unlock_bh_state(bh);
+	return ret;
+}
+
+/**
  * dedupfs_try_to_allocate()
  * @sb:			superblock
  * @handle:		handle to this transaction
@@ -661,22 +853,22 @@ find_next_usable_block(int start, struct buffer_head *bh, int maxblocks)
  * and at last, allocate the blocks by claiming the found free bit as allocated.
  *
  * To set the range of this allocation:
- * 	if there is a reservation window, only try to allocate block(s)
- * 	from the file's own reservation window;
- * 	Otherwise, the allocation range starts from the give goal block,
- * 	ends at the block group's last block.
+ *	if there is a reservation window, only try to allocate block(s) from the
+ *	file's own reservation window;
+ *	Otherwise, the allocation range starts from the give goal block, ends at
+ *	the block group's last block.
  *
  * If we failed to allocate the desired block then we may end up crossing to a
- * new bitmap.
+ * new bitmap.  In that case we must release write access to the old one via
+ * dedupfs_journal_release_buffer(), else we'll run out of credits.
  */
-static int
-dedupfs_try_to_allocate(struct super_block *sb, int group,
+static dedupfs_grpblk_t
+dedupfs_try_to_allocate(struct super_block *sb, handle_t *handle, int group,
 			struct buffer_head *bitmap_bh, dedupfs_grpblk_t grp_goal,
-			unsigned long *count,
-			struct dedupfs_reserve_window *my_rsv)
+			unsigned long *count, struct dedupfs_reserve_window *my_rsv)
 {
-	dedupfs_fsblk_t group_first_block;
-       	dedupfs_grpblk_t start, end;
+	dedupfsblk_t group_first_block;
+	dedupfs_grpblk_t start, end;
 	unsigned long num = 0;
 
 	/* we do allocation within the reservation window if we have a window */
@@ -706,7 +898,7 @@ dedupfs_try_to_allocate(struct super_block *sb, int group,
 	BUG_ON(start > DEDUPFS_BLOCKS_PER_GROUP(sb));
 
 repeat:
-	if (grp_goal < 0) {
+	if (grp_goal < 0 || !dedupfs_test_allocatable(grp_goal, bitmap_bh)) {
 		grp_goal = find_next_usable_block(start, bitmap_bh, end);
 		if (grp_goal < 0)
 			goto fail_access;
@@ -714,16 +906,16 @@ repeat:
 			int i;
 
 			for (i = 0; i < 7 && grp_goal > start &&
-					!dedupfs_test_bit(grp_goal - 1,
-					     		bitmap_bh->b_data);
-			     		i++, grp_goal--)
+					dedupfs_test_allocatable(grp_goal - 1,
+								bitmap_bh);
+					i++, grp_goal--)
 				;
 		}
 	}
 	start = grp_goal;
 
-	if (dedupfs_set_bit_atomic(sb_bgl_lock(DEDUPFS_SB(sb), group), grp_goal,
-			       				bitmap_bh->b_data)) {
+	if (!claim_block(sb_bgl_lock(DEDUPFS_SB(sb), group),
+		grp_goal, bitmap_bh)) {
 		/*
 		 * The block was allocated by another thread, or it was
 		 * allocated and then freed by another thread
@@ -737,8 +929,9 @@ repeat:
 	num++;
 	grp_goal++;
 	while (num < *count && grp_goal < end
-		&& !dedupfs_set_bit_atomic(sb_bgl_lock(DEDUPFS_SB(sb), group),
-					grp_goal, bitmap_bh->b_data)) {
+		&& dedupfs_test_allocatable(grp_goal, bitmap_bh)
+		&& claim_block(sb_bgl_lock(DEDUPFS_SB(sb), group),
+				grp_goal, bitmap_bh)) {
 		num++;
 		grp_goal++;
 	}
@@ -750,12 +943,12 @@ fail_access:
 }
 
 /**
- * 	find_next_reservable_window():
+ *	find_next_reservable_window():
  *		find a reservable space within the given range.
  *		It does not allocate the reservation window for now:
  *		alloc_new_reservation() will do the work later.
  *
- * 	@search_head: the head of the searching list;
+ *	@search_head: the head of the searching list;
  *		This is not necessarily the list head of the whole filesystem
  *
  *		We have both head and start_block to assist the search
@@ -763,12 +956,12 @@ fail_access:
  *		but we will shift to the place where start_block is,
  *		then start from there, when looking for a reservable space.
  *
- * 	@size: the target new reservation window size
+ *	@size: the target new reservation window size
  *
- * 	@group_first_block: the first block we consider to start
+ *	@group_first_block: the first block we consider to start
  *			the real search from
  *
- * 	@last_block:
+ *	@last_block:
  *		the maximum block number that our goal reservable space
  *		could start from. This is normally the last block in this
  *		group. The search will end when we found the start of next
@@ -776,22 +969,22 @@ fail_access:
  *		This could handle the cross boundary reservation window
  *		request.
  *
- * 	basically we search from the given range, rather than the whole
- * 	reservation double linked list, (start_block, last_block)
- * 	to find a free region that is of my size and has not
- * 	been reserved.
+ *	basically we search from the given range, rather than the whole
+ *	reservation double linked list, (start_block, last_block)
+ *	to find a free region that is of my size and has not
+ *	been reserved.
  *
  */
 static int find_next_reservable_window(
 				struct dedupfs_reserve_window_node *search_head,
 				struct dedupfs_reserve_window_node *my_rsv,
 				struct super_block * sb,
-				dedupfs_fsblk_t start_block,
-				dedupfs_fsblk_t last_block)
+				dedupfsblk_t start_block,
+				dedupfsblk_t last_block)
 {
 	struct rb_node *next;
 	struct dedupfs_reserve_window_node *rsv, *prev;
-	dedupfs_fsblk_t cur;
+	dedupfsblk_t cur;
 	int size = my_rsv->rsv_goal_size;
 
 	/* TODO: make the start of the reservation window byte-aligned */
@@ -832,7 +1025,7 @@ static int find_next_reservable_window(
 			/*
 			 * Found a reserveable space big enough.  We could
 			 * have a reservation across the group boundary here
-		 	 */
+			 */
 			break;
 		}
 	}
@@ -868,7 +1061,7 @@ static int find_next_reservable_window(
 }
 
 /**
- * 	alloc_new_reservation()--allocate a new reservation window
+ *	alloc_new_reservation()--allocate a new reservation window
  *
  *		To make a new reservation, we search part of the filesystem
  *		reservation list (the list that inside the group). We try to
@@ -895,8 +1088,8 @@ static int find_next_reservable_window(
  *
  *	@grp_goal: The goal (group-relative).  It is where the search for a
  *		free reservable space should start from.
- *		if we have a goal(goal >0 ), then start from there,
- *		no goal(goal = -1), we start from the first block
+ *		if we have a grp_goal(grp_goal >0 ), then start from there,
+ *		no grp_goal(grp_goal = -1), we start from the first block
  *		of the group.
  *
  *	@sb: the super block
@@ -909,7 +1102,7 @@ static int alloc_new_reservation(struct dedupfs_reserve_window_node *my_rsv,
 		unsigned int group, struct buffer_head *bitmap_bh)
 {
 	struct dedupfs_reserve_window_node *search_head;
-	dedupfs_fsblk_t group_first_block, group_end_block, start_block;
+	dedupfsblk_t group_first_block, group_end_block, start_block;
 	dedupfs_grpblk_t first_free_block;
 	struct rb_root *fs_rsv_root = &DEDUPFS_SB(sb)->s_rsv_window_root;
 	unsigned long size;
@@ -991,8 +1184,10 @@ retry:
 	 * Before we reserve this reservable space, we need
 	 * to make sure there is at least a free block inside this region.
 	 *
-	 * Search the first free bit on the block bitmap.  Search starts from
-	 * the start block of the reservable space we just found.
+	 * searching the first free bit on the block bitmap and copy of
+	 * last committed bitmap alternatively, until we found a allocatable
+	 * block. Search start from the start block of the reservable space
+	 * we just found.
 	 */
 	spin_unlock(rsv_lock);
 	first_free_block = bitmap_search_next_usable_block(
@@ -1044,7 +1239,7 @@ retry:
  * window. To make this more efficient, given the total number of
  * blocks needed and the current size of the window, we try to
  * expand the reservation window size if necessary on a best-effort
- * basis before dedupfs_new_blocks() tries to allocate blocks.
+ * basis before dedupfs_new_blocks() tries to allocate blocks,
  */
 static void try_to_extend_reservation(struct dedupfs_reserve_window_node *my_rsv,
 			struct super_block *sb, int size)
@@ -1074,11 +1269,13 @@ static void try_to_extend_reservation(struct dedupfs_reserve_window_node *my_rsv
 /**
  * dedupfs_try_to_allocate_with_rsv()
  * @sb:			superblock
+ * @handle:		handle to this transaction
  * @group:		given allocation block group
  * @bitmap_bh:		bufferhead holds the block bitmap
  * @grp_goal:		given target block within the group
  * @count:		target number of blocks to allocate
  * @my_rsv:		reservation window
+ * @errp:		pointer to store the error code
  *
  * This is the main function used to allocate a new block and its reservation
  * window.
@@ -1096,16 +1293,33 @@ static void try_to_extend_reservation(struct dedupfs_reserve_window_node *my_rsv
  * being reserved.
  *
  * We use a red-black tree for the per-filesystem reservation list.
+ *
  */
 static dedupfs_grpblk_t
-dedupfs_try_to_allocate_with_rsv(struct super_block *sb, unsigned int group,
-			struct buffer_head *bitmap_bh, dedupfs_grpblk_t grp_goal,
+dedupfs_try_to_allocate_with_rsv(struct super_block *sb, handle_t *handle,
+			unsigned int group, struct buffer_head *bitmap_bh,
+			dedupfs_grpblk_t grp_goal,
 			struct dedupfs_reserve_window_node * my_rsv,
-			unsigned long *count)
+			unsigned long *count, int *errp)
 {
-	dedupfs_fsblk_t group_first_block, group_last_block;
+	dedupfsblk_t group_first_block, group_last_block;
 	dedupfs_grpblk_t ret = 0;
+	int fatal;
 	unsigned long num = *count;
+
+	*errp = 0;
+
+	/*
+	 * Make sure we use undo access for the bitmap, because it is critical
+	 * that we do the frozen_data COW on bitmap buffers in all cases even
+	 * if the buffer is in BJ_Forget state in the committing transaction.
+	 */
+	BUFFER_TRACE(bitmap_bh, "get undo access for new block");
+	fatal = dedupfs_journal_get_undo_access(handle, bitmap_bh);
+	if (fatal) {
+		*errp = fatal;
+		return -1;
+	}
 
 	/*
 	 * we don't deal with reservation when
@@ -1113,9 +1327,10 @@ dedupfs_try_to_allocate_with_rsv(struct super_block *sb, unsigned int group,
 	 * or the file is not a regular file
 	 * or last attempt to allocate a block with reservation turned on failed
 	 */
-	if (my_rsv == NULL) {
-		return dedupfs_try_to_allocate(sb, group, bitmap_bh,
+	if (my_rsv == NULL ) {
+		ret = dedupfs_try_to_allocate(sb, handle, group, bitmap_bh,
 						grp_goal, count, NULL);
+		goto out;
 	}
 	/*
 	 * grp_goal is a group relative block number (if there is a goal)
@@ -1169,8 +1384,8 @@ dedupfs_try_to_allocate_with_rsv(struct super_block *sb, unsigned int group,
 			rsv_window_dump(&DEDUPFS_SB(sb)->s_rsv_window_root, 1);
 			BUG();
 		}
-		ret = dedupfs_try_to_allocate(sb, group, bitmap_bh, grp_goal,
-					   &num, &my_rsv->rsv_window);
+		ret = dedupfs_try_to_allocate(sb, handle, group, bitmap_bh,
+					   grp_goal, &num, &my_rsv->rsv_window);
 		if (ret >= 0) {
 			my_rsv->rsv_alloc_hit += num;
 			*count = num;
@@ -1178,6 +1393,20 @@ dedupfs_try_to_allocate_with_rsv(struct super_block *sb, unsigned int group,
 		}
 		num = *count;
 	}
+out:
+	if (ret >= 0) {
+		BUFFER_TRACE(bitmap_bh, "journal_dirty_metadata for "
+					"bitmap block");
+		fatal = dedupfs_journal_dirty_metadata(handle, bitmap_bh);
+		if (fatal) {
+			*errp = fatal;
+			return -1;
+		}
+		return ret;
+	}
+
+	BUFFER_TRACE(bitmap_bh, "journal_release_buffer");
+	dedupfs_journal_release_buffer(handle, bitmap_bh);
 	return ret;
 }
 
@@ -1189,7 +1418,7 @@ dedupfs_try_to_allocate_with_rsv(struct super_block *sb, unsigned int group,
  */
 static int dedupfs_has_free_blocks(struct dedupfs_sb_info *sbi)
 {
-	dedupfs_fsblk_t free_blocks, root_blocks;
+	dedupfsblk_t free_blocks, root_blocks;
 
 	free_blocks = percpu_counter_read_positive(&sbi->s_freeblocks_counter);
 	root_blocks = le32_to_cpu(sbi->s_es->s_r_blocks_count);
@@ -1201,22 +1430,44 @@ static int dedupfs_has_free_blocks(struct dedupfs_sb_info *sbi)
 	return 1;
 }
 
-/*
+/**
+ * dedupfs_should_retry_alloc()
+ * @sb:			super block
+ * @retries		number of attemps has been made
+ *
+ * dedupfs_should_retry_alloc() is called when ENOSPC is returned, and if
+ * it is profitable to retry the operation, this function will wait
+ * for the current or commiting transaction to complete, and then
+ * return TRUE.
+ *
+ * if the total number of retries exceed three times, return FALSE.
+ */
+int dedupfs_should_retry_alloc(struct super_block *sb, int *retries)
+{
+	if (!dedupfs_has_free_blocks(DEDUPFS_SB(sb)) || (*retries)++ > 3)
+		return 0;
+
+	jbd_debug(1, "%s: retrying operation after ENOSPC\n", sb->s_id);
+
+	return journal_force_commit_nested(DEDUPFS_SB(sb)->s_journal);
+}
+
+/**
  * dedupfs_new_blocks() -- core block(s) allocation function
+ * @handle:		handle to this transaction
  * @inode:		file inode
  * @goal:		given target block(filesystem wide)
  * @count:		target number of blocks to allocate
  * @errp:		error code
  *
- * dedupfs_new_blocks uses a goal block to assist allocation.  If the goal is
- * free, or there is a free block within 32 blocks of the goal, that block
- * is allocated.  Otherwise a forward search is made for a free block; within 
- * each block group the search first looks for an entire free byte in the block
- * bitmap, and then for any free bit if that fails.
- * This function also updates quota and i_blocks field.
+ * dedupfs_new_blocks uses a goal block to assist allocation.  It tries to
+ * allocate block(s) from the block group contains the goal block first. If that
+ * fails, it will try to allocate block(s) from other block groups without
+ * any specific goal block.
+ *
  */
-dedupfs_fsblk_t dedupfs_new_blocks(struct inode *inode, dedupfs_fsblk_t goal,
-		    unsigned long *count, int *errp)
+dedupfsblk_t dedupfs_new_blocks(handle_t *handle, struct inode *inode,
+			dedupfsblk_t goal, unsigned long *count, int *errp)
 {
 	struct buffer_head *bitmap_bh = NULL;
 	struct buffer_head *gdp_bh;
@@ -1224,8 +1475,9 @@ dedupfs_fsblk_t dedupfs_new_blocks(struct inode *inode, dedupfs_fsblk_t goal,
 	int goal_group;
 	dedupfs_grpblk_t grp_target_blk;	/* blockgroup relative goal block */
 	dedupfs_grpblk_t grp_alloc_blk;	/* blockgroup-relative allocated block*/
-	dedupfs_fsblk_t ret_block;		/* filesyetem-wide allocated block */
+	dedupfsblk_t ret_block;		/* filesyetem-wide allocated block */
 	int bgi;			/* blockgroup iteration index */
+	int fatal = 0, err;
 	int performed_allocation = 0;
 	dedupfs_grpblk_t free_blocks;	/* number of free blocks in a group */
 	struct super_block *sb;
@@ -1235,23 +1487,25 @@ dedupfs_fsblk_t dedupfs_new_blocks(struct inode *inode, dedupfs_fsblk_t goal,
 	struct dedupfs_reserve_window_node *my_rsv = NULL;
 	struct dedupfs_block_alloc_info *block_i;
 	unsigned short windowsz = 0;
+#ifdef DEDUPFS_DEBUG
+	static int goal_hits, goal_attempts;
+#endif
 	unsigned long ngroups;
 	unsigned long num = *count;
-	int ret;
 
 	*errp = -ENOSPC;
 	sb = inode->i_sb;
 	if (!sb) {
-		printk("dedupfs_new_blocks: nonexistent device");
+		printk("dedupfs_new_block: nonexistent device");
 		return 0;
 	}
 
 	/*
 	 * Check quota for allocation of this block.
 	 */
-	ret = dquot_alloc_block(inode, num);
-	if (ret) {
-		*errp = ret;
+	err = dquot_alloc_block(inode, num);
+	if (err) {
+		*errp = err;
 		return 0;
 	}
 
@@ -1267,11 +1521,8 @@ dedupfs_fsblk_t dedupfs_new_blocks(struct inode *inode, dedupfs_fsblk_t goal,
 	 * reservation on that particular file)
 	 */
 	block_i = DEDUPFS_I(inode)->i_block_alloc_info;
-	if (block_i) {
-		windowsz = block_i->rsv_window_node.rsv_goal_size;
-		if (windowsz > 0)
-			my_rsv = &block_i->rsv_window_node;
-	}
+	if (block_i && ((windowsz = block_i->rsv_window_node.rsv_goal_size) > 0))
+		my_rsv = &block_i->rsv_window_node;
 
 	if (!dedupfs_has_free_blocks(sbi)) {
 		*errp = -ENOSPC;
@@ -1308,9 +1559,11 @@ retry_alloc:
 		bitmap_bh = read_block_bitmap(sb, group_no);
 		if (!bitmap_bh)
 			goto io_error;
-		grp_alloc_blk = dedupfs_try_to_allocate_with_rsv(sb, group_no,
-					bitmap_bh, grp_target_blk,
-					my_rsv, &num);
+		grp_alloc_blk = dedupfs_try_to_allocate_with_rsv(sb, handle,
+					group_no, bitmap_bh, grp_target_blk,
+					my_rsv,	&num, &fatal);
+		if (fatal)
+			goto out;
 		if (grp_alloc_blk >= 0)
 			goto allocated;
 	}
@@ -1329,7 +1582,6 @@ retry_alloc:
 		gdp = dedupfs_get_group_desc(sb, group_no, &gdp_bh);
 		if (!gdp)
 			goto io_error;
-
 		free_blocks = le16_to_cpu(gdp->bg_free_blocks_count);
 		/*
 		 * skip this group (and avoid loading bitmap) if there
@@ -1352,8 +1604,11 @@ retry_alloc:
 		/*
 		 * try to allocate block(s) from this group, without a goal(-1).
 		 */
-		grp_alloc_blk = dedupfs_try_to_allocate_with_rsv(sb, group_no,
-					bitmap_bh, -1, my_rsv, &num);
+		grp_alloc_blk = dedupfs_try_to_allocate_with_rsv(sb, handle,
+					group_no, bitmap_bh, -1, my_rsv,
+					&num, &fatal);
+		if (fatal)
+			goto out;
 		if (grp_alloc_blk >= 0)
 			goto allocated;
 	}
@@ -1379,6 +1634,11 @@ allocated:
 	dedupfs_debug("using block group %d(%d)\n",
 			group_no, gdp->bg_free_blocks_count);
 
+	BUFFER_TRACE(gdp_bh, "get_write_access");
+	fatal = dedupfs_journal_get_write_access(handle, gdp_bh);
+	if (fatal)
+		goto out;
+
 	ret_block = grp_alloc_blk + dedupfs_group_first_block_no(sb, group_no);
 
 	if (in_range(le32_to_cpu(gdp->bg_block_bitmap), ret_block, num) ||
@@ -1387,122 +1647,163 @@ allocated:
 		      DEDUPFS_SB(sb)->s_itb_per_group) ||
 	    in_range(ret_block + num - 1, le32_to_cpu(gdp->bg_inode_table),
 		      DEDUPFS_SB(sb)->s_itb_per_group)) {
-		dedupfs_error(sb, "dedupfs_new_blocks",
+		dedupfs_error(sb, "dedupfs_new_block",
 			    "Allocating block in system zone - "
-			    "blocks from "E2FSBLK", length %lu",
-			    ret_block, num);
+			    "blocks from "E3FSBLK", length %lu",
+			     ret_block, num);
 		/*
-		 * dedupfs_try_to_allocate marked the blocks we allocated as in
-		 * use.  So we may want to selectively mark some of the blocks
-		 * as free
+		 * claim_block() marked the blocks we allocated as in use. So we
+		 * may want to selectively mark some of the blocks as free.
 		 */
 		goto retry_alloc;
 	}
 
 	performed_allocation = 1;
 
+#ifdef CONFIG_JBD_DEBUG
+	{
+		struct buffer_head *debug_bh;
+
+		/* Record bitmap buffer state in the newly allocated block */
+		debug_bh = sb_find_get_block(sb, ret_block);
+		if (debug_bh) {
+			BUFFER_TRACE(debug_bh, "state when allocated");
+			BUFFER_TRACE2(debug_bh, bitmap_bh, "bitmap state");
+			brelse(debug_bh);
+		}
+	}
+	jbd_lock_bh_state(bitmap_bh);
+	spin_lock(sb_bgl_lock(sbi, group_no));
+	if (buffer_jbd(bitmap_bh) && bh2jh(bitmap_bh)->b_committed_data) {
+		int i;
+
+		for (i = 0; i < num; i++) {
+			if (dedupfs_test_bit(grp_alloc_blk+i,
+					bh2jh(bitmap_bh)->b_committed_data)) {
+				printk("%s: block was unexpectedly set in "
+					"b_committed_data\n", __func__);
+			}
+		}
+	}
+	dedupfs_debug("found bit %d\n", grp_alloc_blk);
+	spin_unlock(sb_bgl_lock(sbi, group_no));
+	jbd_unlock_bh_state(bitmap_bh);
+#endif
+
 	if (ret_block + num - 1 >= le32_to_cpu(es->s_blocks_count)) {
-		dedupfs_error(sb, "dedupfs_new_blocks",
-			    "block("E2FSBLK") >= blocks count(%d) - "
+		dedupfs_error(sb, "dedupfs_new_block",
+			    "block("E3FSBLK") >= blocks count(%d) - "
 			    "block_group = %d, es == %p ", ret_block,
 			le32_to_cpu(es->s_blocks_count), group_no, es);
 		goto out;
 	}
 
-	group_adjust_blocks(sb, group_no, gdp, gdp_bh, -num);
+	/*
+	 * It is up to the caller to add the new buffer to a journal
+	 * list of some description.  We don't know in advance whether
+	 * the caller wants to use it as metadata or data.
+	 */
+	dedupfs_debug("allocating block %lu. Goal hits %d of %d.\n",
+			ret_block, goal_hits, goal_attempts);
+
+	spin_lock(sb_bgl_lock(sbi, group_no));
+	le16_add_cpu(&gdp->bg_free_blocks_count, -num);
+	spin_unlock(sb_bgl_lock(sbi, group_no));
 	percpu_counter_sub(&sbi->s_freeblocks_counter, num);
 
-	mark_buffer_dirty(bitmap_bh);
-	if (sb->s_flags & MS_SYNCHRONOUS)
-		sync_dirty_buffer(bitmap_bh);
+	BUFFER_TRACE(gdp_bh, "journal_dirty_metadata for group descriptor");
+	err = dedupfs_journal_dirty_metadata(handle, gdp_bh);
+	if (!fatal)
+		fatal = err;
+
+	if (fatal)
+		goto out;
 
 	*errp = 0;
 	brelse(bitmap_bh);
-	dquot_free_block_nodirty(inode, *count-num);
-	mark_inode_dirty(inode);
+	dquot_free_block(inode, *count-num);
 	*count = num;
 	return ret_block;
 
 io_error:
 	*errp = -EIO;
 out:
+	if (fatal) {
+		*errp = fatal;
+		dedupfs_std_error(sb, fatal);
+	}
 	/*
 	 * Undo the block allocation
 	 */
-	if (!performed_allocation) {
-		dquot_free_block_nodirty(inode, *count);
-		mark_inode_dirty(inode);
-	}
+	if (!performed_allocation)
+		dquot_free_block(inode, *count);
 	brelse(bitmap_bh);
 	return 0;
 }
 
-dedupfs_fsblk_t dedupfs_new_block(struct inode *inode, unsigned long goal, int *errp)
+dedupfsblk_t dedupfs_new_block(handle_t *handle, struct inode *inode,
+			dedupfsblk_t goal, int *errp)
 {
 	unsigned long count = 1;
 
-	return dedupfs_new_blocks(inode, goal, &count, errp);
+	return dedupfs_new_blocks(handle, inode, goal, &count, errp);
 }
 
-#ifdef DEDUPFS_DEBUG
-
-static const int nibblemap[] = {4, 3, 3, 2, 3, 2, 2, 1, 3, 2, 2, 1, 2, 1, 1, 0};
-
-unsigned long dedupfs_count_free (struct buffer_head * map, unsigned int numchars)
+/**
+ * dedupfs_count_free_blocks() -- count filesystem free blocks
+ * @sb:		superblock
+ *
+ * Adds up the number of free blocks from each block group.
+ */
+dedupfsblk_t dedupfs_count_free_blocks(struct super_block *sb)
 {
-	unsigned int i;
-	unsigned long sum = 0;
-
-	if (!map)
-		return (0);
-	for (i = 0; i < numchars; i++)
-		sum += nibblemap[map->b_data[i] & 0xf] +
-			nibblemap[(map->b_data[i] >> 4) & 0xf];
-	return (sum);
-}
-
-#endif  /*  DEDUPFS_DEBUG  */
-
-unsigned long dedupfs_count_free_blocks (struct super_block * sb)
-{
-	struct dedupfs_group_desc * desc;
-	unsigned long desc_count = 0;
+	dedupfsblk_t desc_count;
+	struct dedupfs_group_desc *gdp;
 	int i;
+	unsigned long ngroups = DEDUPFS_SB(sb)->s_groups_count;
 #ifdef DEDUPFS_DEBUG
-	unsigned long bitmap_count, x;
 	struct dedupfs_super_block *es;
+	dedupfsblk_t bitmap_count;
+	unsigned long x;
+	struct buffer_head *bitmap_bh = NULL;
 
 	es = DEDUPFS_SB(sb)->s_es;
 	desc_count = 0;
 	bitmap_count = 0;
-	desc = NULL;
-	for (i = 0; i < DEDUPFS_SB(sb)->s_groups_count; i++) {
-		struct buffer_head *bitmap_bh;
-		desc = dedupfs_get_group_desc (sb, i, NULL);
-		if (!desc)
+	gdp = NULL;
+
+	smp_rmb();
+	for (i = 0; i < ngroups; i++) {
+		gdp = dedupfs_get_group_desc(sb, i, NULL);
+		if (!gdp)
 			continue;
-		desc_count += le16_to_cpu(desc->bg_free_blocks_count);
-		bitmap_bh = read_block_bitmap(sb, i);
-		if (!bitmap_bh)
-			continue;
-		
-		x = dedupfs_count_free(bitmap_bh, sb->s_blocksize);
-		printk ("group %d: stored = %d, counted = %lu\n",
-			i, le16_to_cpu(desc->bg_free_blocks_count), x);
-		bitmap_count += x;
+		desc_count += le16_to_cpu(gdp->bg_free_blocks_count);
 		brelse(bitmap_bh);
+		bitmap_bh = read_block_bitmap(sb, i);
+		if (bitmap_bh == NULL)
+			continue;
+
+		x = dedupfs_count_free(bitmap_bh, sb->s_blocksize);
+		printk("group %d: stored = %d, counted = %lu\n",
+			i, le16_to_cpu(gdp->bg_free_blocks_count), x);
+		bitmap_count += x;
 	}
-	printk("dedupfs_count_free_blocks: stored = %lu, computed = %lu, %lu\n",
-		(long)le32_to_cpu(es->s_free_blocks_count),
+	brelse(bitmap_bh);
+	printk("dedupfs_count_free_blocks: stored = "E3FSBLK
+		", computed = "E3FSBLK", "E3FSBLK"\n",
+	       le32_to_cpu(es->s_free_blocks_count),
 		desc_count, bitmap_count);
 	return bitmap_count;
 #else
-        for (i = 0; i < DEDUPFS_SB(sb)->s_groups_count; i++) {
-                desc = dedupfs_get_group_desc (sb, i, NULL);
-                if (!desc)
-                        continue;
-                desc_count += le16_to_cpu(desc->bg_free_blocks_count);
+	desc_count = 0;
+	smp_rmb();
+	for (i = 0; i < ngroups; i++) {
+		gdp = dedupfs_get_group_desc(sb, i, NULL);
+		if (!gdp)
+			continue;
+		desc_count += le16_to_cpu(gdp->bg_free_blocks_count);
 	}
+
 	return desc_count;
 #endif
 }
@@ -1520,8 +1821,10 @@ static int dedupfs_group_sparse(int group)
 {
 	if (group <= 1)
 		return 1;
-	return (test_root(group, 3) || test_root(group, 5) ||
-		test_root(group, 7));
+	if (!(group & 1))
+		return 0;
+	return (test_root(group, 7) || test_root(group, 5) ||
+		test_root(group, 3));
 }
 
 /**
@@ -1534,10 +1837,27 @@ static int dedupfs_group_sparse(int group)
  */
 int dedupfs_bg_has_super(struct super_block *sb, int group)
 {
-	if (DEDUPFS_HAS_RO_COMPAT_FEATURE(sb,DEDUPFS_FEATURE_RO_COMPAT_SPARSE_SUPER)&&
-	    !dedupfs_group_sparse(group))
+	if (DEDUPFS_HAS_RO_COMPAT_FEATURE(sb,
+				DEDUPFS_FEATURE_RO_COMPAT_SPARSE_SUPER) &&
+			!dedupfs_group_sparse(group))
 		return 0;
 	return 1;
+}
+
+static unsigned long dedupfs_bg_num_gdb_meta(struct super_block *sb, int group)
+{
+	unsigned long metagroup = group / DEDUPFS_DESC_PER_BLOCK(sb);
+	unsigned long first = metagroup * DEDUPFS_DESC_PER_BLOCK(sb);
+	unsigned long last = first + DEDUPFS_DESC_PER_BLOCK(sb) - 1;
+
+	if (group == first || group == first + 1 || group == last)
+		return 1;
+	return 0;
+}
+
+static unsigned long dedupfs_bg_num_gdb_nometa(struct super_block *sb, int group)
+{
+	return dedupfs_bg_has_super(sb, group) ? DEDUPFS_SB(sb)->s_gdb_count : 0;
 }
 
 /**
@@ -1551,6 +1871,14 @@ int dedupfs_bg_has_super(struct super_block *sb, int group)
  */
 unsigned long dedupfs_bg_num_gdb(struct super_block *sb, int group)
 {
-	return dedupfs_bg_has_super(sb, group) ? DEDUPFS_SB(sb)->s_gdb_count : 0;
-}
+	unsigned long first_meta_bg =
+			le32_to_cpu(DEDUPFS_SB(sb)->s_es->s_first_meta_bg);
+	unsigned long metagroup = group / DEDUPFS_DESC_PER_BLOCK(sb);
 
+	if (!DEDUPFS_HAS_INCOMPAT_FEATURE(sb,DEDUPFS_FEATURE_INCOMPAT_META_BG) ||
+			metagroup < first_meta_bg)
+		return dedupfs_bg_num_gdb_nometa(sb,group);
+
+	return dedupfs_bg_num_gdb_meta(sb,group);
+
+}
