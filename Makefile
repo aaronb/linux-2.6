@@ -4,6 +4,8 @@ SUBLEVEL = 36
 EXTRAVERSION =
 NAME = Flesh-Eating Bats with Fangs
 
+ARCH=um
+
 # *DOCUMENTATION*
 # To see a list of typical targets execute "make help"
 # More info can be located in ./README
@@ -1513,6 +1515,13 @@ endif	# skip-makefile
 
 PHONY += FORCE
 FORCE:
+
+PHONY += run rungdb
+run: linux
+	./linux ubda=Debian-5.0-x86-root_fs ubdb=ext3image mem=128M
+
+rungdb: linux
+	gdb -x gdbcommands --args ./linux ubda=Debian-5.0-x86-root_fs ubdb=ext3image mem=128M
 
 # Declare the contents of the .PHONY variable as phony.  We keep that
 # information in a variable so we can use it in if_changed and friends.

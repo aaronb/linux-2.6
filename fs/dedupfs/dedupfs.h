@@ -27,7 +27,8 @@
 /*
  * Define DEDUPFS_DEBUG to produce debug messages
  */
-#undef DEDUPFS_DEBUG
+//#undef DEDUPFS_DEBUG
+#define DEDUPFS_DEBUG
 
 /*
  * Define DEDUPFS_RESERVATION to reserve data blocks for expanding files

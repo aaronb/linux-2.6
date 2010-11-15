@@ -1,5 +1,6 @@
 config DEDUPFS
 	tristate "Dedup fs support"
+	depends on CRYPTO_HASH
 	help
 	  DedupFS is a filesystem based on dedupfs with block deduplication.
 

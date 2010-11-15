@@ -40,6 +40,8 @@
 #include <linux/namei.h>
 #include "xattr.h"
 #include "acl.h"
+#include <linux/crypto.h>
+#include <linux/scatterlist.h>
 
 static int dedupfs_writepage_trans_blocks(struct inode *inode);
 
@@ -1628,6 +1630,131 @@ out_fail:
 	return ret;
 }
 
+/**
+ * ecryptfs_calculate_md5 - calculates the md5 of @src
+ * @dst: Pointer to 16 bytes of allocated memory
+ * @crypt_stat: Pointer to crypt_stat struct for the current inode
+ * @src: Data to be md5'd
+ * @len: Length of @src
+ *
+ * Uses the allocated crypto context that crypt_stat references to
+ * generate the MD5 sum of the contents of src.
+ */
+/*
+static int dedupfs_calculate_hash(char *dst,
+				  struct ecryptfs_crypt_stat *crypt_stat,
+				  char *src, int len)
+{
+	struct scatterlist sg;
+	struct hash_desc desc = {
+		.tfm = crypt_stat->hash_tfm,
+		.flags = CRYPTO_TFM_REQ_MAY_SLEEP
+	};
+	int rc = 0;
+
+	mutex_lock(&crypt_stat->cs_hash_tfm_mutex);
+	sg_init_one(&sg, (u8 *)src, len);
+	if (!desc.tfm) {
+		desc.tfm = crypto_alloc_hash(ECRYPTFS_DEFAULT_HASH, 0,
+					     CRYPTO_ALG_ASYNC);
+		if (IS_ERR(desc.tfm)) {
+			rc = PTR_ERR(desc.tfm);
+			ecryptfs_printk(KERN_ERR, "Error attempting to "
+					"allocate crypto context; rc = [%d]\n",
+					rc);
+			goto out;
+		}
+		crypt_stat->hash_tfm = desc.tfm;
+	}
+	rc = crypto_hash_init(&desc);
+	if (rc) {
+		printk(KERN_ERR
+		       "%s: Error initializing crypto hash; rc = [%d]\n",
+		       __func__, rc);
+		goto out;
+	}
+	rc = crypto_hash_update(&desc, &sg, len);
+	if (rc) {
+		printk(KERN_ERR
+		       "%s: Error updating crypto hash; rc = [%d]\n",
+		       __func__, rc);
+		goto out;
+	}
+	rc = crypto_hash_final(&desc, dst);
+	if (rc) {
+		printk(KERN_ERR
+		       "%s: Error finalizing crypto hash; rc = [%d]\n",
+		       __func__, rc);
+		goto out;
+	}
+out:
+	mutex_unlock(&crypt_stat->cs_hash_tfm_mutex);
+	return rc;
+}*/
+
+void dedupfs_to_hex(char *dst, char *src, size_t src_size)
+{
+	int x;
+
+	for (x = 0; x < src_size; x++)
+		sprintf(&dst[x * 2], "%.2x", (unsigned char)src[x]);
+}
+
+static int printhash(handle_t *handle, struct buffer_head *bh) {
+	struct crypto_hash *tfm;
+	char *algo = "md5";
+	struct hash_desc desc;
+	char hash_output[512];
+	char formated[512];
+	struct scatterlist sg;
+	int ret;
+
+	if (!buffer_mapped(bh)) 
+		return 0;
+
+	sg_init_one(&sg, bh->b_data, bh->b_size);
+
+	tfm = crypto_alloc_hash(algo, 0, CRYPTO_ALG_ASYNC);
+	if (IS_ERR(tfm)) {
+		printk(KERN_ERR "failed to load transform for %s: %ld\n", algo,
+		       PTR_ERR(tfm));
+		goto hash_fail;
+	}
+
+	desc.tfm = tfm;
+	desc.flags = 0;
+
+	int digest_size = crypto_hash_digestsize(tfm);
+	
+	if (digest_size > sizeof(hash_output)) {
+		printk(KERN_ERR "digestsize(%u) > outputbuffer(%zu)\n",
+		       crypto_hash_digestsize(tfm), sizeof(hash_output));
+		goto hash_fail;
+	}
+
+	ret = crypto_hash_init(&desc);
+	if (ret)
+		goto hash_fail;
+	ret = crypto_hash_update(&desc, &sg, bh->b_size);
+	if (ret)
+		goto hash_fail;
+	ret = crypto_hash_final(&desc, hash_output);
+	if (ret)
+		goto hash_fail;
+
+	dedupfs_to_hex(formated, hash_output, digest_size);
+	dedupfs_debug("block: %ld hash: %s data: \"%.20s\"...\n", 
+			(long)bh->b_blocknr, formated, (char*)bh->b_data);
+
+	crypto_free_hash(tfm);
+	return 0;
+
+hash_fail:
+	crypto_free_hash(tfm);
+
+	return -1;
+}
+
 static int dedupfs_writeback_writepage(struct page *page,
 				struct writeback_control *wbc)
 {
@@ -1639,10 +1766,13 @@ static int dedupfs_writeback_writepage(struct page *page,
 	J_ASSERT(PageLocked(page));
 	WARN_ON_ONCE(IS_RDONLY(inode));
 
+
 	if (dedupfs_journal_current_handle())
 		goto out_fail;
 
 	if (page_has_buffers(page)) {
+		walk_page_buffers(NULL, page_buffers(page), 0,
+				      PAGE_CACHE_SIZE, NULL, printhash);
 		if (!walk_page_buffers(NULL, page_buffers(page), 0,
 				      PAGE_CACHE_SIZE, NULL, buffer_unmapped)) {
 			/* Provide NULL get_block() to catch bugs if buffers
