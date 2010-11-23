@@ -37,6 +37,7 @@
 #include <linux/quotaops.h>
 #include <linux/seq_file.h>
 #include <linux/log2.h>
+#include <linux/crypto.h>
 
 #include <asm/uaccess.h>
 
@@ -802,7 +803,7 @@ enum {
 	Opt_usrjquota, Opt_grpjquota, Opt_offusrjquota, Opt_offgrpjquota,
 	Opt_jqfmt_vfsold, Opt_jqfmt_vfsv0, Opt_jqfmt_vfsv1, Opt_quota,
 	Opt_noquota, Opt_ignore, Opt_barrier, Opt_nobarrier, Opt_err,
-	Opt_resize, Opt_usrquota, Opt_grpquota
+	Opt_resize, Opt_usrquota, Opt_grpquota, Opt_hash, Opt_hash_cache
 };
 
 static const match_table_t tokens = {
@@ -859,6 +860,8 @@ static const match_table_t tokens = {
 	{Opt_barrier, "barrier"},
 	{Opt_nobarrier, "nobarrier"},
 	{Opt_resize, "resize"},
+   {Opt_hash, "hash=%s"},
+   {Opt_hash_cache, "hashcache=%u"},
 	{Opt_err, NULL},
 };
 
@@ -1247,6 +1250,25 @@ set_qf_format:
 			dedupfs_msg(sb, KERN_WARNING,
 				"warning: ignoring deprecated bh option");
 			break;
+      case Opt_hash:
+         sbi->hash_alg = match_strdup(&args[0]);
+         dedupfs_debug("hash algorithm: %s\n", sbi->hash_alg);
+         sbi->hash_tfm = crypto_alloc_hash(sbi->hash_alg, 0, CRYPTO_ALG_ASYNC);
+         if (IS_ERR(sbi->hash_tfm)) {
+            dedupfs_msg(sb, KERN_ERR,
+                  "failed to load transform for %s: %ld\n", sbi->hash_alg,
+                  PTR_ERR(sbi->hash_tfm));
+            return 0;
+         }        
+         sbi->hash_len = crypto_hash_digestsize(sbi->hash_tfm);
+         break;
+      case Opt_hash_cache:
+         if (match_int(&args[0], &option))
+				return 0;
+			sbi->hash_cache_size = option;
+         dedupfs_debug("hash cache size: %u\n", sbi->hash_cache_size);
+			break;
+
 		default:
 			dedupfs_msg(sb, KERN_ERR,
 				"error: unrecognized mount option \"%s\" "

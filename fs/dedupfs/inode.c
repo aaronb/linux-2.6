@@ -1700,35 +1700,30 @@ void dedupfs_to_hex(char *dst, char *src, size_t src_size)
 		sprintf(&dst[x * 2], "%.2x", (unsigned char)src[x]);
 }
 
-static int printhash(handle_t *handle, struct buffer_head *bh) {
-	struct crypto_hash *tfm;
-	char *algo = "md5";
+static int printhash(struct inode *inode, struct buffer_head *bh) {
+
+   struct dedupfs_sb_info* sbi;
 	struct hash_desc desc;
 	char hash_output[512];
 	char formated[512];
 	struct scatterlist sg;
 	int ret;
 
+   sbi = inode->i_sb->s_fs_info;
+
 	if (!buffer_mapped(bh)) 
 		return 0;
 
 	sg_init_one(&sg, bh->b_data, bh->b_size);
 
-	tfm = crypto_alloc_hash(algo, 0, CRYPTO_ALG_ASYNC);
-	if (IS_ERR(tfm)) {
-		printk(KERN_ERR "failed to load transform for %s: %ld\n", algo,
-		       PTR_ERR(tfm));
-		goto hash_fail;
-	}
-
-	desc.tfm = tfm;
+	desc.tfm = sbi->hash_tfm;
 	desc.flags = 0;
 
-	int digest_size = crypto_hash_digestsize(tfm);
+	int digest_size = sbi->hash_len;
 	
 	if (digest_size > sizeof(hash_output)) {
 		printk(KERN_ERR "digestsize(%u) > outputbuffer(%zu)\n",
-		       crypto_hash_digestsize(tfm), sizeof(hash_output));
+		       crypto_hash_digestsize(sbi->hash_tfm), sizeof(hash_output));
 		goto hash_fail;
 	}
 
@@ -1743,15 +1738,12 @@ static int printhash(handle_t *handle, struct buffer_head *bh) {
 		goto hash_fail;
 
 	dedupfs_to_hex(formated, hash_output, digest_size);
-	dedupfs_debug("block: %ld hash: %s data: \"%.20s\"...\n", 
-			(long)bh->b_blocknr, formated, (char*)bh->b_data);
+	dedupfs_debug("block: %ld hash: %s digest: %s data: \"%.20s\"...\n", 
+			(long)bh->b_blocknr, sbi->hash_alg, formated, (char*)bh->b_data);
 
-	crypto_free_hash(tfm);
 	return 0;
 
 hash_fail:
-	crypto_free_hash(tfm);
-
 	return -1;
 }
 
@@ -1771,7 +1763,7 @@ static int dedupfs_writeback_writepage(struct page *page,
 		goto out_fail;
 
 	if (page_has_buffers(page)) {
-		walk_page_buffers(NULL, page_buffers(page), 0,
+		walk_page_buffers(inode, page_buffers(page), 0,
 				      PAGE_CACHE_SIZE, NULL, printhash);
 		if (!walk_page_buffers(NULL, page_buffers(page), 0,
 				      PAGE_CACHE_SIZE, NULL, buffer_unmapped)) {

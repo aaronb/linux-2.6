@@ -23,6 +23,9 @@
 #include <linux/percpu_counter.h>
 #endif
 #include <linux/rbtree.h>
+#include <linux/crypto.h>
+
+#define MAX_HASH_ALG_LEN (32)
 
 /*
  * third extended-fs super-block data in memory
@@ -84,6 +87,12 @@ struct dedupfs_sb_info {
 	char *s_qf_names[MAXQUOTAS];		/* Names of quota files with journalled quota */
 	int s_jquota_fmt;			/* Format of quota to use */
 #endif
+
+   /* Deduplication */
+   char *hash_alg;
+   unsigned int hash_len;
+   unsigned int hash_cache_size;
+   struct crypto_hash *hash_tfm;
 };
 
 static inline spinlock_t *
