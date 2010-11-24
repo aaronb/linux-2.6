@@ -5,10 +5,18 @@
 // hashvalue.
 //
 
+#define IDEAL_HT_LOAD (0.7)
+
+struct hash_cache {
+  void *table;
+  void *pool;
+  size_t hashbits_in_record;
+  size_t hashbits_in_index;
+};
+
+
 // Initialize the hash cache structures.
-void dedup_hash_init(struct super_block *sb,
-                     size_t hash_len,
-                     size_t memory_bound);
+void dedup_hash_init(struct super_block *sb);
 
 // Lookup a list of block numbers that have a given hashvalue
 void dedup_hash_lookup(void* hashval,
