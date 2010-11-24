@@ -1,0 +1,23 @@
+// hashcache.h
+// 
+// An interface for storing a mapping from the hash value of
+// data blocks to blocknumber that contain data witht the same
+// hashvalue.
+//
+
+// Initialize the hash cache structures.
+void dedup_hash_init(struct super_block *sb,
+                     size_t hash_len,
+                     size_t memory_bound);
+
+// Lookup a list of block numbers that have a given hashvalue
+void dedup_hash_lookup(void* hashval,
+                       __le32 target_block,
+                       __le32 * matched_blocks,
+                       size_t n);
+
+// Removes a hashval/blocknum pair from the hash cache
+void dedup_hash_remove(void* hashval,
+                       __le32 block);
+
+
