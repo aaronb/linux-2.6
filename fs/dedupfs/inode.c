@@ -43,6 +43,9 @@
 #include <linux/crypto.h>
 #include <linux/scatterlist.h>
 
+#define BLOCK_CREATE_IF_UNALLOC (1)
+#define BLOCK_CREATE_FORCE (2)
+
 static int dedupfs_writepage_trans_blocks(struct inode *inode);
 
 /*
@@ -848,7 +851,7 @@ int dedupfs_get_blocks_handle(handle_t *handle, struct inode *inode,
 	partial = dedupfs_get_branch(inode, depth, offsets, chain, &err);
 
 	/* Simplest case - block found, no allocation needed */
-	if (!partial) {
+	if (!partial && create != BLOCK_CREATE_FORCE) {
 		first_block = le32_to_cpu(chain[depth - 1].key);
 		clear_buffer_new(bh_result);
 		count++;
@@ -988,6 +991,9 @@ static int dedupfs_get_block(struct inode *inode, sector_t iblock,
 	int ret = 0, started = 0;
 	unsigned max_blocks = bh_result->b_size >> inode->i_blkbits;
 
+	if (create)
+		create = BLOCK_CREATE_IF_UNALLOC;
+
 	if (create && !handle) {	/* Direct IO write... */
 		if (max_blocks > DIO_MAX_BLOCKS)
 			max_blocks = DIO_MAX_BLOCKS;
@@ -1011,6 +1017,26 @@ static int dedupfs_get_block(struct inode *inode, sector_t iblock,
 out:
 	return ret;
 }
+
+static int dedupfs_get_new_block(struct inode *inode, sector_t iblock,
+			struct buffer_head *bh_result)
+{
+	handle_t *handle = dedupfs_journal_current_handle();
+	int ret = 0, started = 0;
+	unsigned max_blocks = bh_result->b_size >> inode->i_blkbits;
+
+	ret = dedupfs_get_blocks_handle(handle, inode, iblock,
+					max_blocks, bh_result, BLOCK_CREATE_FORCE);
+	if (ret > 0) {
+		bh_result->b_size = (ret << inode->i_blkbits);
+		ret = 0;
+	}
+	if (started)
+		dedupfs_journal_stop(handle);
+
+	return ret;
+}
+
 
 int dedupfs_fiemap(struct inode *inode, struct fiemap_extent_info *fieinfo,
 		u64 start, u64 len)
@@ -1630,68 +1656,6 @@ out_fail:
 	return ret;
 }
 
-/**
- * ecryptfs_calculate_md5 - calculates the md5 of @src
- * @dst: Pointer to 16 bytes of allocated memory
- * @crypt_stat: Pointer to crypt_stat struct for the current inode
- * @src: Data to be md5'd
- * @len: Length of @src
- *
- * Uses the allocated crypto context that crypt_stat references to
- * generate the MD5 sum of the contents of src.
- */
-/*
-static int dedupfs_calculate_hash(char *dst,
-				  struct ecryptfs_crypt_stat *crypt_stat,
-				  char *src, int len)
-{
-	struct scatterlist sg;
-	struct hash_desc desc = {
-		.tfm = crypt_stat->hash_tfm,
-		.flags = CRYPTO_TFM_REQ_MAY_SLEEP
-	};
-	int rc = 0;
-
-	mutex_lock(&crypt_stat->cs_hash_tfm_mutex);
-	sg_init_one(&sg, (u8 *)src, len);
-	if (!desc.tfm) {
-		desc.tfm = crypto_alloc_hash(ECRYPTFS_DEFAULT_HASH, 0,
-					     CRYPTO_ALG_ASYNC);
-		if (IS_ERR(desc.tfm)) {
-			rc = PTR_ERR(desc.tfm);
-			ecryptfs_printk(KERN_ERR, "Error attempting to "
-					"allocate crypto context; rc = [%d]\n",
-					rc);
-			goto out;
-		}
-		crypt_stat->hash_tfm = desc.tfm;
-	}
-	rc = crypto_hash_init(&desc);
-	if (rc) {
-		printk(KERN_ERR
-		       "%s: Error initializing crypto hash; rc = [%d]\n",
-		       __func__, rc);
-		goto out;
-	}
-	rc = crypto_hash_update(&desc, &sg, len);
-	if (rc) {
-		printk(KERN_ERR
-		       "%s: Error updating crypto hash; rc = [%d]\n",
-		       __func__, rc);
-		goto out;
-	}
-	rc = crypto_hash_final(&desc, dst);
-	if (rc) {
-		printk(KERN_ERR
-		       "%s: Error finalizing crypto hash; rc = [%d]\n",
-		       __func__, rc);
-		goto out;
-	}
-out:
-	mutex_unlock(&crypt_stat->cs_hash_tfm_mutex);
-	return rc;
-}*/
-
 void dedupfs_to_hex(char *dst, char *src, size_t src_size)
 {
 	int x;
@@ -1700,16 +1664,27 @@ void dedupfs_to_hex(char *dst, char *src, size_t src_size)
 		sprintf(&dst[x * 2], "%.2x", (unsigned char)src[x]);
 }
 
-static int printhash(struct inode *inode, struct buffer_head *bh) {
+static int printhash(handle_t * handle, struct buffer_head *bh) {
 
-   struct dedupfs_sb_info* sbi;
+	struct page *page;
+	struct inode *inode;
+	struct dedupfs_sb_info* sbi;
 	struct hash_desc desc;
-	char hash_output[512];
-	char formated[512];
+	char hash_output[64];
+	char formated[256];
+	int digest_size;
 	struct scatterlist sg;
 	int ret;
+	int err;
+	unsigned int bbits;
 
-   sbi = inode->i_sb->s_fs_info;
+	int needed_blocks;
+
+	sector_t iblock;
+
+	page = bh->b_page;
+	inode = page->mapping->host;
+	sbi = inode->i_sb->s_fs_info;
 
 	if (!buffer_mapped(bh)) 
 		return 0;
@@ -1719,7 +1694,7 @@ static int printhash(struct inode *inode, struct buffer_head *bh) {
 	desc.tfm = sbi->hash_tfm;
 	desc.flags = 0;
 
-	int digest_size = sbi->hash_len;
+	digest_size = sbi->hash_len;
 	
 	if (digest_size > sizeof(hash_output)) {
 		printk(KERN_ERR "digestsize(%u) > outputbuffer(%zu)\n",
@@ -1741,11 +1716,45 @@ static int printhash(struct inode *inode, struct buffer_head *bh) {
 	dedupfs_debug("block: %ld hash: %s digest: %s data: \"%.20s\"...\n", 
 			(long)bh->b_blocknr, sbi->hash_alg, formated, (char*)bh->b_data);
 
+	
 	return 0;
 
 hash_fail:
 	return -1;
 }
+
+static int move_block(handle_t * handle, struct buffer_head *bh) {
+	struct page *page;
+	struct inode *inode;
+	unsigned int bbits;
+	int needed_blocks;
+	sector_t iblock;
+	int ret;
+
+	if (!buffer_mapped(bh)) 
+		return -1;
+
+	page = bh->b_page;
+	inode = page->mapping->host;
+
+	//create new block
+	needed_blocks = dedupfs_writepage_trans_blocks(inode) + 1;
+	handle = dedupfs_journal_start(inode, needed_blocks);
+	if (IS_ERR(handle)) {
+		ret = PTR_ERR(handle);
+		return -1;
+	}
+	bbits = inode->i_blkbits;
+	iblock = (sector_t)page->index << (PAGE_CACHE_SHIFT - bbits);
+	ret = dedupfs_get_new_block(inode, iblock, bh);
+	if (ret)
+		return -1;
+	dedupfs_journal_stop(handle);
+
+	return 0;
+}
+
+
 
 static int dedupfs_writeback_writepage(struct page *page,
 				struct writeback_control *wbc)
@@ -1763,8 +1772,14 @@ static int dedupfs_writeback_writepage(struct page *page,
 		goto out_fail;
 
 	if (page_has_buffers(page)) {
-		walk_page_buffers(inode, page_buffers(page), 0,
+		walk_page_buffers(NULL, page_buffers(page), 0,
 				      PAGE_CACHE_SIZE, NULL, printhash);
+#if(0)
+		walk_page_buffers(NULL, page_buffers(page), 0,
+				      PAGE_CACHE_SIZE, NULL, move_block);
+		walk_page_buffers(NULL, page_buffers(page), 0,
+				      PAGE_CACHE_SIZE, NULL, printhash);
+#endif
 		if (!walk_page_buffers(NULL, page_buffers(page), 0,
 				      PAGE_CACHE_SIZE, NULL, buffer_unmapped)) {
 			/* Provide NULL get_block() to catch bugs if buffers
