@@ -853,10 +853,13 @@ int dedupfs_get_blocks_handle(handle_t *handle, struct inode *inode,
 		goto out;
 
 	partial = dedupfs_get_branch(inode, depth, offsets, chain, &err);
-   
-   if (partial == NULL && create == BLOCK_CREATE_FORCE) {
-      partial = &chain[depth-1];
-   }
+
+	dedupfs_debug("inode=%p block=%u depth=%i partial=%p chain=%p",
+			inode, iblock, depth, partial, chain);
+
+	if (partial == NULL && create == BLOCK_CREATE_FORCE) {
+		partial = &chain[depth-1];
+	}
 
 	/* Simplest case - block found, no allocation needed */
 	if (!partial) {
@@ -981,6 +984,92 @@ out:
 	return err;
 }
 
+
+/*
+ * free logical block iblock and instead point to new_block
+ * @handle journal handle
+ * @inode
+ * @iblock block offset within file
+ *
+ */
+int dedupfs_combine_blocks_handle(handle_t *handle, struct inode *inode,
+		sector_t iblock, dedupfsblk_t new_block,
+		struct buffer_head *bh_result
+		)
+{
+	int err = -EIO;
+	int offsets[4];
+	Indirect chain[4];
+	Indirect *partial;
+	dedupfsblk_t goal;
+	dedupfsblk_t old_block;
+	int indirect_blks;
+	int blocks_to_boundary = 0;
+	int depth;
+	struct dedupfs_inode_info *ei = DEDUPFS_I(inode);
+	int count = 0;
+	dedupfsblk_t first_block = 0;
+
+
+	//J_ASSERT(handle != NULL || create == 0);
+	depth = dedupfs_block_to_path(inode,iblock,offsets,&blocks_to_boundary);
+
+	if (depth == 0)
+		goto out;
+
+	mutex_lock(&ei->truncate_mutex);
+
+	partial = dedupfs_get_branch(inode, depth, offsets, chain, &err);
+
+	if (partial) {
+		//TODO: bad (this means there is no existing block there)
+	}
+	
+	/*
+	 * set partial to point to the leaf in the branch (this is the 
+	 * data block itself)
+	 */
+	partial = chain + (depth - 1);
+
+	old_block = le32_to_cpu(chain[depth - 1].key);
+	//TODO: free old_block
+
+	//perhaps *partial[0].p should be zero as it has been freed?
+	//*partial[0].p = 0
+
+	partial[0].key = cpu_to_le32(new_block);
+
+	dedupfs_debug("old=%u new=%u", old_block, new_block);
+
+	//the splice function should take care of updating the parent
+	//node in the tree that points to the new block
+	if (!err)
+		err = dedupfs_splice_branch(handle, inode, iblock,
+					partial, indirect_blks, count);
+	mutex_unlock(&ei->truncate_mutex);
+	if (err)
+		goto cleanup;
+
+	set_buffer_new(bh_result);
+got_it:
+	map_bh(bh_result, inode->i_sb, le32_to_cpu(chain[depth-1].key));
+	if (count > blocks_to_boundary)
+		set_buffer_boundary(bh_result);
+	err = count;
+	/* Clean up and exit */
+	partial = chain + depth - 1;	/* the whole chain */
+cleanup:
+	while (partial > chain) {
+		BUFFER_TRACE(partial->bh, "call brelse");
+		brelse(partial->bh);
+		partial--;
+	}
+	BUFFER_TRACE(bh_result, "returned");
+out:
+	return err;
+}
+
+
 /* Maximum number of blocks we map for direct IO at once. */
 #define DIO_MAX_BLOCKS 4096
 /*
@@ -1039,6 +1128,21 @@ static int dedupfs_get_new_block(struct inode *inode, sector_t iblock,
 		bh_result->b_size = (ret << inode->i_blkbits);
 		ret = 0;
 	}
+	if (started)
+		dedupfs_journal_stop(handle);
+
+	return ret;
+}
+
+static int dedupfs_combine_block(struct inode *inode, sector_t iblock,
+			dedupfsblk_t new_block,
+			struct buffer_head *bh_result)
+{
+	handle_t *handle = dedupfs_journal_current_handle();
+	int ret = 0, started = 0;
+
+	ret = dedupfs_combine_blocks_handle(handle, inode, iblock, new_block,
+					 bh_result);
 	if (started)
 		dedupfs_journal_stop(handle);
 
@@ -1745,6 +1849,7 @@ static int move_block(handle_t * handle, struct buffer_head *bh) {
 	page = bh->b_page;
 	inode = page->mapping->host;
 
+#if(0)
 	//create new block
 	needed_blocks = dedupfs_writepage_trans_blocks(inode) + 1;
 	handle = dedupfs_journal_start(inode, needed_blocks);
@@ -1758,6 +1863,25 @@ static int move_block(handle_t * handle, struct buffer_head *bh) {
 	if (ret)
 		return -1;
 	dedupfs_journal_stop(handle);
+#endif
+
+#if(1)
+	//combine block
+	handle = dedupfs_journal_start(inode, needed_blocks);
+	if (IS_ERR(handle)) {
+		ret = PTR_ERR(handle);
+		return -1;
+	}
+	bbits = inode->i_blkbits;
+	iblock = (sector_t)page->index << (PAGE_CACHE_SHIFT - bbits);
+	ret = dedupfs_combine_block(inode, iblock, 6668, bh);
+	//TODO: mark buffer as clean
+	if (ret)
+		return -1;
+	dedupfs_journal_stop(handle);
+#endif
+
+
 
 	return 0;
 }
