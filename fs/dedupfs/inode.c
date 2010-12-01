@@ -854,10 +854,10 @@ int dedupfs_get_blocks_handle(handle_t *handle, struct inode *inode,
 
 	partial = dedupfs_get_branch(inode, depth, offsets, chain, &err);
 
-	dedupfs_debug("inode=%p block=%u depth=%i partial=%p chain=%p",
-			inode, iblock, depth, partial, chain);
 
 	if (partial == NULL && create == BLOCK_CREATE_FORCE) {
+      dedupfs_debug("inode=%p block=%u depth=%i partial=%p chain=%p",
+			inode, iblock, depth, partial, chain);
 		partial = &chain[depth-1];
 	}
 
@@ -1032,7 +1032,11 @@ int dedupfs_combine_blocks_handle(handle_t *handle, struct inode *inode,
 	partial = chain + (depth - 1);
 
 	old_block = le32_to_cpu(chain[depth - 1].key);
-	//TODO: free old_block
+
+	dedupfs_debug("inode=%p old_block=%u new_block=%u",
+			inode, iblock, old_block, new_block);
+
+   dedupfs_free_blocks(handle, inode, old_block, 1);
 
 	//perhaps *partial[0].p should be zero as it has been freed?
 	//*partial[0].p = 0
@@ -1867,15 +1871,15 @@ static int move_block(handle_t * handle, struct buffer_head *bh) {
 
 #if(1)
 	//combine block
-	handle = dedupfs_journal_start(inode, needed_blocks);
+	handle = dedupfs_journal_start(inode, 3);
 	if (IS_ERR(handle)) {
 		ret = PTR_ERR(handle);
 		return -1;
 	}
 	bbits = inode->i_blkbits;
 	iblock = (sector_t)page->index << (PAGE_CACHE_SHIFT - bbits);
-	ret = dedupfs_combine_block(inode, iblock, 6668, bh);
-	//TODO: mark buffer as clean
+	ret = dedupfs_combine_block(inode, iblock, 1538, bh);
+   clear_buffer_dirty(bh);
 	if (ret)
 		return -1;
 	dedupfs_journal_stop(handle);
