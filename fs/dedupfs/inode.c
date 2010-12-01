@@ -806,6 +806,10 @@ err_out:
 }
 
 /*
+ * @handle journal handle
+ * @inode
+ * @iblock block offset within file
+ *
  * Allocation strategy is simple: if we have to allocate something, we will
  * have to go the whole way to leaf. So let's do it before attaching anything
  * to tree, set linkage between the newborn blocks, write them if sync is
@@ -849,9 +853,13 @@ int dedupfs_get_blocks_handle(handle_t *handle, struct inode *inode,
 		goto out;
 
 	partial = dedupfs_get_branch(inode, depth, offsets, chain, &err);
+   
+   if (partial == NULL && create == BLOCK_CREATE_FORCE) {
+      partial = &chain[depth-1];
+   }
 
 	/* Simplest case - block found, no allocation needed */
-	if (!partial && create != BLOCK_CREATE_FORCE) {
+	if (!partial) {
 		first_block = le32_to_cpu(chain[depth - 1].key);
 		clear_buffer_new(bh_result);
 		count++;
