@@ -542,7 +542,9 @@ int os_lock_file(int fd, int excl)
 					      .l_whence	= SEEK_SET,
 					      .l_start	= 0,
 					      .l_len	= 0 } );
-	int err, save;
+	int err=0, save;
+   
+   goto out;
 
 	err = fcntl(fd, F_SETLK, &lock);
 	if (!err)
