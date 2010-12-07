@@ -15,14 +15,12 @@
 // non-empty bucket, and the first item in the bucket (the oldest in the
 // bucket) is evicted.
 //
-#include <stdlib.h>
-#include <limits.h>
-#include <string.h>
-#include <stdint.h>
+#include <linux/slab.h>
+#include <linux/string.h>
 
 #define HT_IBITS (16)
 #define HT_SIZE (1 << HT_IBITS)
-#define BYTES(bits) (bits/CHAR_BIT)
+#define BYTES(bits) (bits/8) // 8 bits per byte?
 
 typedef uint32_t block_ptr_t;
 typedef uint32_t ht_index_t;

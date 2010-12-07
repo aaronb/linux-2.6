@@ -1,14 +1,15 @@
 #include "hashcache.h"
 
 int hashcache_split_hashval(hash_cache_t *hc, char *hashval, char *tag, ht_index_t *idx) {
+    int i;
+
     // strip out the item bytes
     memcpy(tag, hashval, hc->tag_len);
     
     // strip out the index bytes
     *idx = 0;
-    int i;
     for (i=hc->tag_len; i<hc->hash_len; i++) {
-        *idx <<= CHAR_BIT;
+        *idx <<= 8; // 8 bits per byte, OK assumption?
         *idx += hashval[i];
     }
     
@@ -16,29 +17,32 @@ int hashcache_split_hashval(hash_cache_t *hc, char *hashval, char *tag, ht_index
 }
 
 int hashcache_init(hash_cache_t *hc, size_t cache_size, size_t hashlen) {
+    size_t item_size;
+    int i;
+    ht_item_t *item;
+
     hc->hash_len = hashlen;
     hc->idx_len = BYTES(HT_IBITS);
     hc->tag_len = hashlen - hc->idx_len;
     
-    size_t item_size = sizeof(ht_item_t) + hc->tag_len;
+    item_size = sizeof(ht_item_t) + hc->tag_len;
     hc->max_items = cache_size / item_size;
     hc->ht_size = HT_SIZE;
     
-    hc->table = calloc(hc->ht_size, sizeof(ht_item_t*));
+    hc->table = kmalloc(hc->ht_size * sizeof(ht_item_t*), GFP_KERNEL);
     if (hc->table == NULL) return -1;
     
-    hc->itempool = calloc(hc->max_items, sizeof(ht_item_t));
+    hc->itempool = kmalloc(hc->max_items * sizeof(ht_item_t), GFP_KERNEL);
     if (hc->itempool == NULL) return -1;
     
-    hc->tagpool = calloc(hc->max_items, hc->tag_len);
+    hc->tagpool = kmalloc(hc->max_items * hc->tag_len, GFP_KERNEL);
     if (hc->tagpool == NULL) return -1;
     
     hc->free_items = hc->itempool;
     
     // initialize each item slot with dummy data
     // link them all into the free list
-    int i;
-    ht_item_t *item = NULL;
+    item = NULL;
     for (i=0; i<hc->max_items; i++) {
         item = &(hc->itempool[i]);
         item->tag = hc->tagpool + i * hc->tag_len;
@@ -53,19 +57,21 @@ int hashcache_init(hash_cache_t *hc, size_t cache_size, size_t hashlen) {
 }
 
 int hashcache_destroy(hash_cache_t *hc) {
-    free(hc->table);
-    free(hc->itempool);
-    free(hc->tagpool);
+    kfree(hc->table);
+    kfree(hc->itempool);
+    kfree(hc->tagpool);
     return 0;
 }
 
 
 int hashcache_get(hash_cache_t *hc, char *hashval, block_ptr_t *blknum) {
-    ht_index_t idx;
     char tag[hc->tag_len];
+    ht_index_t idx;
+    ht_item_t *item;
+
     hashcache_split_hashval(hc, hashval, tag, &idx);
     
-    ht_item_t *item = NULL;
+    item = NULL;
     if ((item = hc->table[idx]) == NULL) return -1; // bucket empty
     
     while (item != NULL) {
@@ -80,15 +86,17 @@ int hashcache_get(hash_cache_t *hc, char *hashval, block_ptr_t *blknum) {
 }
 
 int hashcache_insert(hash_cache_t *hc, char *hashval, block_ptr_t blknum) {
+    ht_index_t idx;
+    char tag[hc->tag_len];
+    ht_item_t *prev, *item, *new_item;
+
     // if there are no free items, we need to evict something
     if (hc->free_items == NULL) hashcache_evict(hc);
     
-    ht_index_t idx;
-    char tag[hc->tag_len];
     hashcache_split_hashval(hc, hashval, tag, &idx);
     
-    ht_item_t *prev = NULL;
-    ht_item_t *item = hc->table[idx];
+    prev = NULL;
+    item = hc->table[idx];
     while (item != NULL) {
         // existing item with this hash value?
         if (memcmp(item->tag, tag, hc->tag_len) == 0) {
@@ -99,7 +107,7 @@ int hashcache_insert(hash_cache_t *hc, char *hashval, block_ptr_t blknum) {
     }
     
     // insertion point found, need to grab a new item from the pool
-    ht_item_t *new_item = hc->free_items;
+    new_item = hc->free_items;
     hc->free_items = hc->free_items->next;
     
     new_item->next = NULL;
@@ -119,11 +127,13 @@ int hashcache_insert(hash_cache_t *hc, char *hashval, block_ptr_t blknum) {
 
 int hashcache_update(hash_cache_t *hc, char *hashval, block_ptr_t blknum) {
     ht_index_t idx;
+    ht_item_t *prev, *item, *new_item;
     char tag[hc->tag_len];
+
     hashcache_split_hashval(hc, hashval, tag, &idx);
     
-    ht_item_t *prev = NULL;
-    ht_item_t *item = hc->table[idx];
+    prev = NULL;
+    item = hc->table[idx];
     while (item != NULL) {
         if (memcmp(item->tag, tag, hc->tag_len) == 0) {
             // found existing item with this hash value
@@ -136,7 +146,7 @@ int hashcache_update(hash_cache_t *hc, char *hashval, block_ptr_t blknum) {
     
     // no match was found to update so we need to grab a new item from the pool
     if (hc->free_items == NULL) return -1;
-    ht_item_t *new_item = hc->free_items;
+    new_item = hc->free_items;
     hc->free_items = hc->free_items->next;
     
     // initialize the new item
@@ -157,10 +167,12 @@ int hashcache_update(hash_cache_t *hc, char *hashval, block_ptr_t blknum) {
 int hashcache_remove(hash_cache_t *hc, char *hashval) {
     ht_index_t idx;
     char tag[hc->tag_len];
+    ht_item_t *prev, *item;
+
     hashcache_split_hashval(hc, hashval, tag, &idx);
     
-    ht_item_t *prev = NULL;
-    ht_item_t *item = hc->table[idx];
+    prev = NULL;
+    item = hc->table[idx];
     while (item != NULL) {
         if (memcmp(item->tag, tag, hc->tag_len) == 0) {
             // found existing item with this hash value
