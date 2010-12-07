@@ -15,6 +15,10 @@
 // non-empty bucket, and the first item in the bucket (the oldest in the
 // bucket) is evicted.
 //
+
+#ifndef _HASHCACHE_H
+#define _HASHCACHE_H
+
 #include <linux/slab.h>
 #include <linux/string.h>
 
@@ -59,4 +63,4 @@ int hashcache_remove(hash_cache_t *hc, char *hashval);
 int hashcache_split_hashval(hash_cache_t *hc, char *hashval, char *tag, ht_index_t *idx);
 void hashcache_evict(hash_cache_t *hc);
 
-
+#endif

@@ -24,6 +24,7 @@
 #endif
 #include <linux/rbtree.h>
 #include <linux/crypto.h>
+#include "hashcache.h"
 
 #define MAX_HASH_ALG_LEN (32)
 
@@ -93,6 +94,7 @@ struct dedupfs_sb_info {
    unsigned int hash_len;
    unsigned int hash_cache_size;
    struct crypto_hash *hash_tfm;
+   hash_cache_t hc;
 };
 
 static inline spinlock_t *
