@@ -1011,7 +1011,6 @@ int dedupfs_combine_blocks_handle(handle_t *handle, struct inode *inode,
 	int count = 0;
 	//dedupfsblk_t first_block = 0;
 
-
 	//J_ASSERT(handle != NULL || create == 0);
 	depth = dedupfs_block_to_path(inode,iblock,offsets,&blocks_to_boundary);
 
@@ -1033,6 +1032,12 @@ int dedupfs_combine_blocks_handle(handle_t *handle, struct inode *inode,
 	partial = chain + (depth - 1);
 
 	old_block = le32_to_cpu(chain[depth - 1].key);
+
+   if (old_block == new_block) {
+      dedupfs_debug("same block inode=%p offset=%lu block=%lu",
+            inode, (long)iblock, (long)old_block);
+      return -1;
+   }
 
 	dedupfs_debug("inode=%p offset=%lu old_block=%lu new_block=%lu",
 			inode, (long)iblock, (long)old_block, (long)new_block);
@@ -1775,7 +1780,7 @@ out_fail:
 	return ret;
 }
 
-void dedupfs_to_hex(char *dst, char *src, size_t src_size)
+static void dedupfs_to_hex(char *dst, char *src, size_t src_size)
 {
 	int x;
 
@@ -1842,7 +1847,8 @@ hash_fail:
 	return -1;
 }
 
-static int get_hash(struct dedupfs_sb_info *sbi, struct buffer_head *bh, char* digest) {
+static int get_hash(struct dedupfs_sb_info *sbi, struct buffer_head *bh, 
+      char* digest) {
 	struct hash_desc desc;
 	char formated[256];
 	struct scatterlist sg;
@@ -1876,14 +1882,67 @@ hash_fail:
 	return -1;
 }
 
-
-static int try_dedup_block(handle_t * handle, struct buffer_head *bh) {
+static int try_combine_block(handle_t * handle, struct buffer_head *bh, 
+      char* digest, block_ptr_t found_block) {
+   int ret;
+   struct buffer_head *found_block_bh;
+   unsigned int bbits;
+	sector_t iblock;
 	struct page *page;
 	struct inode *inode;
-	unsigned int bbits;
-	//int needed_blocks;
-	sector_t iblock;
+	struct super_block *sb;  
+	struct dedupfs_sb_info* sbi;
+
+   page = bh->b_page;
+	inode = page->mapping->host;
+   sb = inode->i_sb;
+	sbi = sb->s_fs_info;
+
+   //TODO: found block should be locked? to prevent changes
+   //while we do comparison and update refcount
+
+   //check exitsting on disk block
+   found_block_bh = sb_bread(sb, le32_to_cpu(found_block));
+   if (buffer_dirty(found_block_bh)) {
+      dedupfs_debug("FIXME: trying to compare to dirty buffer");
+      //FIXME the found block is dirty and maybe later writen to a 
+      //different pyhsical location due to deduplication
+      return -1;
+   }
+
+   //TODO: sanity checks
+
+   //bytewise comparison
+   if (memcmp(bh->b_data, found_block_bh->b_data, bh->b_size) != 0) {
+      //hash is proably wrong, so remove it from cache
+      hashcache_remove(&(sbi->hc), digest);
+      return -1;
+   }
+
+   //combine blocks
+   handle = dedupfs_journal_start(inode, 3);
+   if (IS_ERR(handle)) {
+      return -1;
+   }
+   bbits = inode->i_blkbits;
+   iblock = (sector_t)page->index << (PAGE_CACHE_SHIFT - bbits);
+   ret = dedupfs_combine_block(inode, iblock, found_block, bh);
+   if (ret) {
+      dedupfs_journal_stop(handle);
+      return -1;
+   }
+   clear_buffer_dirty(bh);
+   dedupfs_journal_stop(handle);
+
+   return 0;
+}
+
+
+static int try_dedup_block(handle_t * handle, struct buffer_head *bh) {
 	int ret;
+	struct page *page;
+	struct inode *inode;
+	struct super_block *sb;  
 	struct dedupfs_sb_info* sbi;
    char digest[512];
    block_ptr_t found_block;
@@ -1893,56 +1952,43 @@ static int try_dedup_block(handle_t * handle, struct buffer_head *bh) {
 
 	page = bh->b_page;
 	inode = page->mapping->host;
-	sbi = inode->i_sb->s_fs_info;
+   sb = inode->i_sb;
+	sbi = sb->s_fs_info;
 
    ret = get_hash(sbi, bh, digest);
-
    ret = hashcache_get(&(sbi->hc), digest, &found_block);
 
-   if (ret == 0) {  
+   if (ret == 0) {
       //found block
-      dedupfs_debug("found duplicate block %lu\n", (long)found_block);
-
-      //TODO: check exitsting on disk block
-
-      //combine blocks
-      handle = dedupfs_journal_start(inode, 3);
-      if (IS_ERR(handle)) {
-         ret = PTR_ERR(handle);
-         return -1;
-      }
-      bbits = inode->i_blkbits;
-      iblock = (sector_t)page->index << (PAGE_CACHE_SHIFT - bbits);
-      ret = dedupfs_combine_block(inode, iblock, found_block, bh);
-      clear_buffer_dirty(bh);
-      if (ret)
-         return -1;
-      dedupfs_journal_stop(handle);
-   } else {
-      dedupfs_debug("no duplicate block\n");
-      
-      //TODO: if refcount > 1, do COW
-      //or always to COW here
-
-#if(0)
-      //create new block
-      needed_blocks = dedupfs_writepage_trans_blocks(inode) + 1;
-      handle = dedupfs_journal_start(inode, needed_blocks);
-      if (IS_ERR(handle)) {
-         ret = PTR_ERR(handle);
-         return -1;
-      }
-      bbits = inode->i_blkbits;
-      iblock = (sector_t)page->index << (PAGE_CACHE_SHIFT - bbits);
-      ret = dedupfs_get_new_block(inode, iblock, bh);
-      if (ret)
-         return -1;
-      dedupfs_journal_stop(handle);
-#endif
-
-      hashcache_insert(&(sbi->hc), digest, bh->b_blocknr);
+      dedupfs_debug("found matching hash, block %lu\n", (long)found_block);
+      ret = try_combine_block(handle, bh, digest, found_block);
+      if (ret == 0)
+         return ret;
    }
 
+   dedupfs_debug("no duplicate block\n");
+      
+   //TODO: if refcount > 1, do COW
+   //or always to COW here
+#if(0)
+   unsigned int bbits;
+   sector_t iblock;
+   //create new block
+   needed_blocks = dedupfs_writepage_trans_blocks(inode) + 1;
+   handle = dedupfs_journal_start(inode, needed_blocks);
+   if (IS_ERR(handle)) {
+      ret = PTR_ERR(handle);
+      return -1;
+   }
+   bbits = inode->i_blkbits;
+   iblock = (sector_t)page->index << (PAGE_CACHE_SHIFT - bbits);
+   ret = dedupfs_get_new_block(inode, iblock, bh);
+   if (ret)
+      return -1;
+   dedupfs_journal_stop(handle);
+#endif
+
+   hashcache_insert(&(sbi->hc), digest, bh->b_blocknr);
    return 0;
 }
 
@@ -1965,12 +2011,10 @@ static int dedupfs_writeback_writepage(struct page *page,
 	if (page_has_buffers(page)) {
 		walk_page_buffers(NULL, page_buffers(page), 0,
 				      PAGE_CACHE_SIZE, NULL, printhash);
-#if(1)
 		walk_page_buffers(NULL, page_buffers(page), 0,
 				      PAGE_CACHE_SIZE, NULL, try_dedup_block);
 		walk_page_buffers(NULL, page_buffers(page), 0,
 				      PAGE_CACHE_SIZE, NULL, printhash);
-#endif
 		if (!walk_page_buffers(NULL, page_buffers(page), 0,
 				      PAGE_CACHE_SIZE, NULL, buffer_unmapped)) {
 			/* Provide NULL get_block() to catch bugs if buffers
