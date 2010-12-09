@@ -39,6 +39,93 @@
 
 #define in_range(b, first, len)	((b) >= (first) && (b) <= (first) + (len) - 1)
 
+#if 0
+/*
+ * increment refernece count for block
+ */
+int dedupfs_block_ref_inc(handle_t *handle, struct super_block *sb, dedupfs_grpblk_t block) {
+	unsigned long inode_number = 12;
+	unsigned long offset_bytes;
+	unsigned long offset_blocks;
+	int err;
+
+	int cur_ref;
+
+	struct inode * inode;
+	struct buffer_head *bh;
+
+	offset_bytes = block;
+	offset_blocks = offset_bytes / sb->s_blocksize;
+       
+	inode = dedupfs_iget(sb, inode_number);
+	
+	bh = dedupfs_getblk(handle, inode, offset_bocks, bh, 1, &err);
+	if (bh == NULL) {
+		dedupfs_debug("bh");
+		return -1;
+	}
+
+	//lock?
+
+	cur_ref = bh.b_data[offset_bytes % sb->s_blocksize];
+	dedupfs_defug("current ref count = %i", cur_ref);
+	if (cur_ref == 255) {
+		return -1;
+	}
+
+	if (cur_ref == 0) {
+
+	}
+
+	bh.b_data[offset_bytes % sb->s_blocksize]++;
+	err = dedupfs_journal_dirty_metadata(handle, bh);
+
+	brelse(bh);
+
+	return err;
+}
+
+int dedupfs_block_ref_dec(handle_t *handle, struct super_block *sb, dedupfs_grpblk_t block) {
+	unsigned long inode_number = 12;
+	unsigned long offset_bytes;
+	unsigned long offset_blocks;
+	int err;
+
+	int cur_ref;
+
+	struct inode * inode;
+	struct buffer_head *bh;
+
+	offset_bytes = block;
+	offset_blocks = offset_bytes / sb->s_blocksize;
+       
+	inode = dedupfs_iget(sb, inode_number);
+	
+	bh = dedupfs_getblk(handle, inode, offset_bocks, bh, 1, &err);
+	if (bh == NULL) {
+		dedupfs_debug("bh");
+		return -1;
+	}
+
+	//lock?
+
+	cur_ref = bh.b_data[offset_bytes % sb->s_blocksize];
+	dedupfs_defug("current ref count = %i", cur_ref);
+	if (cur_ref == 255) {
+		return -1;
+	}
+
+	bh.b_data[offset_bytes % sb->s_blocksize]--;
+	err = dedupfs_journal_dirty_metadata(handle, bh);
+
+	brelse(bh);
+
+	return err;
+}
+
+#endif
+
+
 /**
  * dedupfs_get_group_desc() -- load group descriptor from disk
  * @sb:			super block
@@ -822,6 +909,7 @@ find_next_usable_block(dedupfs_grpblk_t start, struct buffer_head *bh,
 static inline int
 claim_block(spinlock_t *lock, dedupfs_grpblk_t block, struct buffer_head *bh)
 {
+	//TODO: increment reference count here?
 	struct journal_head *jh = bh2jh(bh);
 	int ret;
 
