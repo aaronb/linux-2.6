@@ -39,11 +39,12 @@
 
 #define in_range(b, first, len)	((b) >= (first) && (b) <= (first) + (len) - 1)
 
-#if 0
+#if 1
 /*
  * increment refernece count for block
  */
-int dedupfs_block_ref_inc(handle_t *handle, struct super_block *sb, dedupfs_grpblk_t block) {
+int dedupfs_block_ref_inc(handle_t *handle, struct super_block *sb, 
+      dedupfs_grpblk_t block) {
 	unsigned long inode_number = 12;
 	unsigned long offset_bytes;
 	unsigned long offset_blocks;
@@ -59,7 +60,7 @@ int dedupfs_block_ref_inc(handle_t *handle, struct super_block *sb, dedupfs_grpb
        
 	inode = dedupfs_iget(sb, inode_number);
 	
-	bh = dedupfs_getblk(handle, inode, offset_bocks, bh, 1, &err);
+	bh = dedupfs_getblk(handle, inode, offset_blocks, 1, &err);
 	if (bh == NULL) {
 		dedupfs_debug("bh");
 		return -1;
@@ -67,8 +68,8 @@ int dedupfs_block_ref_inc(handle_t *handle, struct super_block *sb, dedupfs_grpb
 
 	//lock?
 
-	cur_ref = bh.b_data[offset_bytes % sb->s_blocksize];
-	dedupfs_defug("current ref count = %i", cur_ref);
+	cur_ref = bh->b_data[offset_bytes % sb->s_blocksize];
+	dedupfs_debug("current ref count = %i", cur_ref);
 	if (cur_ref == 255) {
 		return -1;
 	}
@@ -77,15 +78,18 @@ int dedupfs_block_ref_inc(handle_t *handle, struct super_block *sb, dedupfs_grpb
 
 	}
 
-	bh.b_data[offset_bytes % sb->s_blocksize]++;
+	bh->b_data[offset_bytes % sb->s_blocksize]++;
 	err = dedupfs_journal_dirty_metadata(handle, bh);
+   if (err)
+      return -1;
 
 	brelse(bh);
 
-	return err;
+	return cur_ref++;
 }
 
-int dedupfs_block_ref_dec(handle_t *handle, struct super_block *sb, dedupfs_grpblk_t block) {
+int dedupfs_block_ref_dec(handle_t *handle, struct super_block *sb, 
+      dedupfs_grpblk_t block) {
 	unsigned long inode_number = 12;
 	unsigned long offset_bytes;
 	unsigned long offset_blocks;
@@ -101,7 +105,7 @@ int dedupfs_block_ref_dec(handle_t *handle, struct super_block *sb, dedupfs_grpb
        
 	inode = dedupfs_iget(sb, inode_number);
 	
-	bh = dedupfs_getblk(handle, inode, offset_bocks, bh, 1, &err);
+	bh = dedupfs_getblk(handle, inode, offset_blocks, 1, &err);
 	if (bh == NULL) {
 		dedupfs_debug("bh");
 		return -1;
@@ -109,18 +113,20 @@ int dedupfs_block_ref_dec(handle_t *handle, struct super_block *sb, dedupfs_grpb
 
 	//lock?
 
-	cur_ref = bh.b_data[offset_bytes % sb->s_blocksize];
-	dedupfs_defug("current ref count = %i", cur_ref);
+	cur_ref = bh->b_data[offset_bytes % sb->s_blocksize];
+	dedupfs_debug("current ref count = %i", cur_ref);
 	if (cur_ref == 255) {
 		return -1;
 	}
 
-	bh.b_data[offset_bytes % sb->s_blocksize]--;
+	bh->b_data[offset_bytes % sb->s_blocksize]--;
 	err = dedupfs_journal_dirty_metadata(handle, bh);
+   if (err)
+      return -1;
 
 	brelse(bh);
 
-	return err;
+	return cur_ref--;
 }
 
 #endif
@@ -561,7 +567,7 @@ void dedupfs_discard_reservation(struct inode *inode)
  * @count:			number of blocks to free
  * @pdquot_freed_blocks:	pointer to quota
  */
-void dedupfs_free_blocks_sb(handle_t *handle, struct super_block *sb,
+void _dedupfs_free_blocks_sb(handle_t *handle, struct super_block *sb,
 			 dedupfsblk_t block, unsigned long count,
 			 unsigned long *pdquot_freed_blocks)
 {
@@ -742,6 +748,36 @@ error_return:
 	brelse(bitmap_bh);
 	dedupfs_std_error(sb, err);
 	return;
+}
+
+void dedupfs_free_blocks_sb(handle_t *handle, struct super_block *sb,
+			 dedupfsblk_t block, unsigned long count,
+			 unsigned long *pdquot_freed_blocks)
+{
+   unsigned long subcount = 0;
+
+   while (count > 0) {
+      //advance until we get to a zero refcount
+      while (count > 0 && dedupfs_block_ref_dec(handle, sb, block) != 0) {
+         count--;
+         block++;
+      }
+      if (count == 0)
+         return;
+      //"block" needs to be freed
+
+      //advance until we get to a nonzero refcount
+      subcount = 1;
+      while (subcount < count && 
+            dedupfs_block_ref_dec(handle, sb, block + subcount) == 0) {         
+         subcount++;
+      }
+
+      _dedupfs_free_blocks_sb(handle, sb, block, subcount, pdquot_freed_blocks);
+      
+      count -= subcount;
+      block += subcount;
+   }
 }
 
 /**
@@ -1580,6 +1616,7 @@ dedupfsblk_t dedupfs_new_blocks(handle_t *handle, struct inode *inode,
 #endif
 	unsigned long ngroups;
 	unsigned long num = *count;
+   unsigned long i;
 
 	*errp = -ENOSPC;
 	sb = inode->i_sb;
@@ -1811,6 +1848,15 @@ allocated:
 	brelse(bitmap_bh);
 	dquot_free_block(inode, *count-num);
 	*count = num;
+
+   for (i=0; i<num; i++) {
+      err = dedupfs_block_ref_inc(handle, sb, ret_block+i);
+      if (err != 1) {
+         dedupfs_debug("allocation mismatch block %u (%u)",
+              (unsigned)(ret_block+i), (unsigned)err);
+      } 
+   }
+
 	return ret_block;
 
 io_error:
