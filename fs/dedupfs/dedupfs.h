@@ -839,6 +839,10 @@ dedupfs_group_first_block_no(struct super_block *sb, unsigned long group_no)
 # define NORET_AND     noreturn,
 
 /* balloc.c */
+extern int dedupfs_block_ref_inc(handle_t *handle, struct super_block *sb, 
+		dedupfs_grpblk_t block);
+extern int dedupfs_block_ref_dec(handle_t *handle, struct super_block *sb, 
+      dedupfs_grpblk_t block);
 extern int dedupfs_bg_has_super(struct super_block *sb, int group);
 extern unsigned long dedupfs_bg_num_gdb(struct super_block *sb, int group);
 extern dedupfsblk_t dedupfs_new_block (handle_t *handle, struct inode *inode,

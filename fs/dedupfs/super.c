@@ -1721,7 +1721,9 @@ static int dedupfs_fill_super (struct super_block *sb, void *data, int silent)
 			    NULL, 0))
 		goto failed_mount;
 
-   hashcache_init(&(sbi->hc), sbi->hash_cache_size, sbi->hash_len);
+   err = hashcache_init(&(sbi->hc), sbi->hash_cache_size, sbi->hash_len);
+	if (err)
+		goto failed_mount;
 
 	sb->s_flags = (sb->s_flags & ~MS_POSIXACL) |
 		(test_opt(sb, POSIX_ACL) ? MS_POSIXACL : 0);

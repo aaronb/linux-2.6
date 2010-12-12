@@ -39,94 +39,128 @@
 
 #define in_range(b, first, len)	((b) >= (first) && (b) <= (first) + (len) - 1)
 
+void print_bh(struct buffer_head *bh) {
+	printk (KERN_DEBUG "bh=%p\n", bh);
+	printk (KERN_DEBUG "state: ");
+	if (buffer_uptodate(bh))
+		printk (KERN_DEBUG "uptodate ");
+	if (buffer_dirty(bh))
+		printk (KERN_DEBUG "dirty ");
+	if (buffer_locked(bh))
+		printk (KERN_DEBUG "lock ");
+	if (buffer_mapped(bh))
+		printk (KERN_DEBUG "mapped ");
+
+	if (buffer_new(bh))
+		printk (KERN_DEBUG "new ");
+
+	printk (KERN_DEBUG "\n");
+	printk (KERN_DEBUG "block=%lu ", (long)bh->b_blocknr);
+	printk (KERN_DEBUG "size=%lu ", (long)bh->b_size);
+	printk (KERN_DEBUG "count=%lu ", (long)bh->b_count.counter);
+	printk (KERN_DEBUG "\n");
+}
+
+struct buffer_head* get_ref_block(struct super_block *sb, unsigned long block) {
+	unsigned long inode_number = 12;
+	struct inode * inode;
+	struct buffer_head *bh;
+	int err;
+
+	inode = dedupfs_iget(sb, inode_number);
+	bh = dedupfs_getblk(NULL, inode, block, 0, &err);
+
+	//print_bh(bh);
+
+	if (!buffer_uptodate(bh)) {
+		brelse(bh);
+
+		lock_buffer(bh);
+
+		get_bh(bh);
+		bh->b_end_io = end_buffer_read_sync;
+		submit_bh(READ_META, bh);
+		wait_on_buffer(bh);
+
+		unlock_buffer(bh);
+	}
+
+	if (!buffer_uptodate(bh)) {
+		dedupfs_debug("read failed");
+	}
+
+	//print_bh(bh);
+
+	if (bh == NULL) {
+		dedupfs_debug("bh");
+		return NULL;
+	}
+
+	return bh;
+}
+
 #if 1
 /*
  * increment refernece count for block
  */
 int dedupfs_block_ref_inc(handle_t *handle, struct super_block *sb, 
-      dedupfs_grpblk_t block) {
-	unsigned long inode_number = 12;
+		dedupfs_grpblk_t block) {
 	unsigned long offset_bytes;
 	unsigned long offset_blocks;
-	int err;
-
 	int cur_ref;
-
-	struct inode * inode;
 	struct buffer_head *bh;
 
 	offset_bytes = block;
 	offset_blocks = offset_bytes / sb->s_blocksize;
-       
-	inode = dedupfs_iget(sb, inode_number);
-	
-	bh = dedupfs_getblk(handle, inode, offset_blocks, 1, &err);
-	if (bh == NULL) {
-		dedupfs_debug("bh");
-		return -1;
-	}
 
-	//lock?
+	bh = get_ref_block(sb, offset_blocks);
+
+	lock_buffer(bh);
 
 	cur_ref = bh->b_data[offset_bytes % sb->s_blocksize];
-	dedupfs_debug("current ref count = %i", cur_ref);
+	dedupfs_debug("current ref count=%d, increment 1", cur_ref);
+
 	if (cur_ref == 255) {
 		return -1;
 	}
 
-	if (cur_ref == 0) {
-
-	}
-
 	bh->b_data[offset_bytes % sb->s_blocksize]++;
-	err = dedupfs_journal_dirty_metadata(handle, bh);
-   if (err)
-      return -1;
+	set_buffer_dirty(bh);
 
-	brelse(bh);
+	unlock_buffer(bh);
+	//brelse(bh);
 
-	return cur_ref++;
+	return cur_ref+1;
 }
 
 int dedupfs_block_ref_dec(handle_t *handle, struct super_block *sb, 
       dedupfs_grpblk_t block) {
-	unsigned long inode_number = 12;
 	unsigned long offset_bytes;
 	unsigned long offset_blocks;
-	int err;
-
 	int cur_ref;
-
-	struct inode * inode;
 	struct buffer_head *bh;
 
 	offset_bytes = block;
 	offset_blocks = offset_bytes / sb->s_blocksize;
-       
-	inode = dedupfs_iget(sb, inode_number);
-	
-	bh = dedupfs_getblk(handle, inode, offset_blocks, 1, &err);
-	if (bh == NULL) {
-		dedupfs_debug("bh");
-		return -1;
-	}
 
-	//lock?
+	bh = get_ref_block(sb, offset_blocks);
+
+	lock_buffer(bh);
 
 	cur_ref = bh->b_data[offset_bytes % sb->s_blocksize];
-	dedupfs_debug("current ref count = %i", cur_ref);
-	if (cur_ref == 255) {
+	dedupfs_debug("current ref count=%d, decrment 1\n", cur_ref);
+
+	if (cur_ref == 0) {
 		return -1;
 	}
 
 	bh->b_data[offset_bytes % sb->s_blocksize]--;
-	err = dedupfs_journal_dirty_metadata(handle, bh);
-   if (err)
-      return -1;
+	set_buffer_dirty(bh);
 
-	brelse(bh);
+	unlock_buffer(bh);
+	//brelse(bh);
 
-	return cur_ref--;
+	return cur_ref-1;
 }
 
 #endif

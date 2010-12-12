@@ -1044,6 +1044,8 @@ int dedupfs_combine_blocks_handle(handle_t *handle, struct inode *inode,
 
    dedupfs_free_blocks(handle, inode, old_block, 1);
 
+   dedupfs_block_ref_inc(handle, inode->i_sb, new_block);
+
 	//perhaps *partial[0].p should be zero as it has been freed?
 	//*partial[0].p = 0
 
