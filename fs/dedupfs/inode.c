@@ -1010,6 +1010,7 @@ int dedupfs_combine_blocks_handle(handle_t *handle, struct inode *inode,
 	struct dedupfs_inode_info *ei = DEDUPFS_I(inode);
 	int count = 0;
 	//dedupfsblk_t first_block = 0;
+	struct dedupfs_block_alloc_info block_ainfo;
 
 	//J_ASSERT(handle != NULL || create == 0);
 	depth = dedupfs_block_to_path(inode,iblock,offsets,&blocks_to_boundary);
@@ -1053,11 +1054,18 @@ int dedupfs_combine_blocks_handle(handle_t *handle, struct inode *inode,
 
 	dedupfs_debug("old=%lu new=%lu", (long)old_block, (long)new_block);
 
+
+	block_ainfo = *(ei->i_block_alloc_info);
+
 	//the splice function should take care of updating the parent
 	//node in the tree that points to the new block
 	if (!err)
 		err = dedupfs_splice_branch(handle, inode, iblock,
 					partial, indirect_blks, count);
+
+	//we didn't actually allocate to end, restore that info
+	memcpy(ei->i_block_alloc_info, &block_ainfo, sizeof(block_ainfo));
+
 	mutex_unlock(&ei->truncate_mutex);
 	if (err)
 		goto cleanup;
@@ -1127,7 +1135,7 @@ out:
 	return ret;
 }
 
-#if(0)
+#if 1
 static int dedupfs_get_new_block(struct inode *inode, sector_t iblock,
 			struct buffer_head *bh_result)
 {
@@ -1969,12 +1977,18 @@ static int try_dedup_block(handle_t * handle, struct buffer_head *bh) {
    }
 
    dedupfs_debug("no duplicate block\n");
-      
+
+	int ref_count = dedupfs_block_ref(handle, sb, bh->b_blocknr);
+
    //TODO: if refcount > 1, do COW
    //or always to COW here
-#if(0)
+	if (ref_count > 1) {
+#if 1
+   dedupfs_debug("doing copy to new block\n");
+	ref_count = dedupfs_block_ref_dec(handle, sb, bh->b_blocknr);
    unsigned int bbits;
    sector_t iblock;
+	int needed_blocks;
    //create new block
    needed_blocks = dedupfs_writepage_trans_blocks(inode) + 1;
    handle = dedupfs_journal_start(inode, needed_blocks);
@@ -1988,7 +2002,9 @@ static int try_dedup_block(handle_t * handle, struct buffer_head *bh) {
    if (ret)
       return -1;
    dedupfs_journal_stop(handle);
+
 #endif
+	}
 
    hashcache_insert(&(sbi->hc), digest, bh->b_blocknr);
    return 0;

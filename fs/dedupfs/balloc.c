@@ -118,23 +118,27 @@ int dedupfs_block_ref_inc(handle_t *handle, struct super_block *sb,
 	lock_buffer(bh);
 
 	cur_ref = bh->b_data[offset_bytes % sb->s_blocksize];
-	dedupfs_debug("current ref count=%d, increment 1", cur_ref);
+	dedupfs_debug("current ref count=%d +1", cur_ref);
 
 	if (cur_ref == 255) {
 		return -1;
 	}
 
+	//dedupfs_journal_get_write_access(handle, bh);
+
 	bh->b_data[offset_bytes % sb->s_blocksize]++;
 	set_buffer_dirty(bh);
 
+	//dedupfs_journal_dirty_metadata(handle, bh);
+
 	unlock_buffer(bh);
-	//brelse(bh);
+	//brelse(bh);	
 
 	return cur_ref+1;
 }
 
 int dedupfs_block_ref_dec(handle_t *handle, struct super_block *sb, 
-      dedupfs_grpblk_t block) {
+		dedupfs_grpblk_t block) {
 	unsigned long offset_bytes;
 	unsigned long offset_blocks;
 	int cur_ref;
@@ -148,19 +152,41 @@ int dedupfs_block_ref_dec(handle_t *handle, struct super_block *sb,
 	lock_buffer(bh);
 
 	cur_ref = bh->b_data[offset_bytes % sb->s_blocksize];
-	dedupfs_debug("current ref count=%d, decrment 1\n", cur_ref);
+	dedupfs_debug("current ref count=%d -1", cur_ref);
 
-	if (cur_ref == 0) {
+	if (cur_ref == 255) {
 		return -1;
 	}
+
+	//dedupfs_journal_get_write_access(handle, bh);
 
 	bh->b_data[offset_bytes % sb->s_blocksize]--;
 	set_buffer_dirty(bh);
 
+	//dedupfs_journal_dirty_metadata(handle, bh);
+
 	unlock_buffer(bh);
-	//brelse(bh);
+	//brelse(bh);	
 
 	return cur_ref-1;
+}
+
+int dedupfs_block_ref(handle_t *handle, struct super_block *sb, 
+      dedupfs_grpblk_t block) {
+	unsigned long offset_bytes;
+	unsigned long offset_blocks;
+	int cur_ref;
+	struct buffer_head *bh;
+
+	offset_bytes = block;
+	offset_blocks = offset_bytes / sb->s_blocksize;
+
+	bh = get_ref_block(sb, offset_blocks);
+
+	cur_ref = bh->b_data[offset_bytes % sb->s_blocksize];
+	dedupfs_debug("current ref count=%d\n", cur_ref);
+
+	return cur_ref;
 }
 
 #endif
