@@ -29,6 +29,11 @@ int hashcache_init(hash_cache_t *hc, size_t cache_size, size_t hashlen) {
     hc->max_items = cache_size / item_size;
     hc->ht_size = HT_SIZE;
     
+    // the cache must be large enough to hold at least 8 items
+    // this is an arbitrary choice, but there's no point to hold less than this
+    // you'd just miss most of the time.
+    if (hc->max_items < 8) return -1;
+    
     hc->table = kmalloc(hc->ht_size * sizeof(ht_item_t*), GFP_KERNEL);
     if (hc->table == NULL) return -1;
     

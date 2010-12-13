@@ -121,6 +121,7 @@ int dedupfs_block_ref_inc(handle_t *handle, struct super_block *sb,
 	dedupfs_debug("current ref count=%d +1", cur_ref);
 
 	if (cur_ref == 255) {
+		unlock_buffer(bh);
 		return -1;
 	}
 
@@ -154,7 +155,8 @@ int dedupfs_block_ref_dec(handle_t *handle, struct super_block *sb,
 	cur_ref = bh->b_data[offset_bytes % sb->s_blocksize];
 	dedupfs_debug("current ref count=%d -1", cur_ref);
 
-	if (cur_ref == 255) {
+	if (cur_ref == 0) {
+		unlock_buffer(bh);
 		return -1;
 	}
 
