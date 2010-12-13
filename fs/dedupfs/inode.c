@@ -1047,7 +1047,9 @@ int dedupfs_combine_blocks_handle(handle_t *handle, struct inode *inode,
 
    // freeing the old block decrements the block count in the inode
    // increment it since we still point to data
+   spin_lock(&inode->i_lock);
    inode->i_blocks++;
+   spin_unlock(&inode->i_lock);
 
    dedupfs_block_ref_inc(handle, inode->i_sb, new_block);
 
