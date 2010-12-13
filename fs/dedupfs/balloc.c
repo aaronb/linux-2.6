@@ -135,6 +135,11 @@ int dedupfs_block_ref_inc(handle_t *handle, struct super_block *sb,
 	unlock_buffer(bh);
 	//brelse(bh);	
 
+   if (cur_ref > 1) { 
+      printk(KERN_INFO "block %d count %d+1\n", 
+            (int)block, cur_ref);
+   }
+
 	return cur_ref+1;
 }
 
@@ -169,6 +174,13 @@ int dedupfs_block_ref_dec(handle_t *handle, struct super_block *sb,
 
 	unlock_buffer(bh);
 	//brelse(bh);	
+   //
+
+   if (cur_ref > 1) { 
+      printk(KERN_INFO "block %d count %d-1\n", 
+            (int)block, cur_ref);
+   }
+
 
 	return cur_ref-1;
 }

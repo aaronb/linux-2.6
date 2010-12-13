@@ -1935,7 +1935,12 @@ static int try_combine_block(handle_t * handle, struct buffer_head *bh,
       return -1;
    }
    bbits = inode->i_blkbits;
+
+   /* that start of the page maps to this block */
    iblock = (sector_t)page->index << (PAGE_CACHE_SHIFT - bbits);
+
+   /* add block offset within page */
+   iblock += (bh->b_data - (char*)((int)bh->b_data & PAGE_CACHE_MASK)) / bh->b_size;
    ret = dedupfs_combine_block(inode, iblock, found_block, bh);
    if (ret) {
       dedupfs_journal_stop(handle);
