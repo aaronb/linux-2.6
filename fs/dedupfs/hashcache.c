@@ -1,17 +1,11 @@
 #include "hashcache.h"
 
 int hashcache_split_hashval(hash_cache_t *hc, char *hashval, char *tag, ht_index_t *idx) {
-    int i;
-
     // strip out the item bytes
     memcpy(tag, hashval, hc->tag_len);
     
-    // strip out the index bytes
-    *idx = 0;
-    for (i=hc->tag_len; i<hc->hash_len; i++) {
-        *idx <<= 8; // 8 bits per byte, OK assumption?
-        *idx += hashval[i];
-    }
+    // strip out the hash table index from end
+    *idx = (ht_index_t)hashval[hc->tag_len]; 
     
     return 0;
 }
