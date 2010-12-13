@@ -858,7 +858,7 @@ int dedupfs_get_blocks_handle(handle_t *handle, struct inode *inode,
 
 	if (partial == NULL && create == BLOCK_CREATE_FORCE) {
       dedupfs_debug("inode=%p block=%lu depth=%i partial=%p chain=%p",
-			inode, iblock, depth, partial, chain);
+			inode, (unsigned long) iblock, depth, partial, chain);
 		partial = &chain[depth-1];
 	}
 
@@ -1048,7 +1048,7 @@ int dedupfs_combine_blocks_handle(handle_t *handle, struct inode *inode,
    // freeing the old block decrements the block count in the inode
    // increment it since we still point to data
    spin_lock(&inode->i_lock);
-   inode->i_blocks++;
+   inode->i_blocks += inode->i_sb->s_blocksize / 512;
    spin_unlock(&inode->i_lock);
 
    dedupfs_block_ref_inc(handle, inode->i_sb, new_block);
@@ -1965,9 +1965,13 @@ static int try_dedup_block(handle_t * handle, struct buffer_head *bh) {
 	struct inode *inode;
 	struct super_block *sb;  
 	struct dedupfs_sb_info* sbi;
-   char digest[512];
-   block_ptr_t found_block;
-
+	char digest[512];
+	block_ptr_t found_block;
+	int ref_count;
+	unsigned int bbits;
+	sector_t iblock;
+	int needed_blocks;
+	
 	if (!buffer_mapped(bh)) 
 		return -1;
 
@@ -1989,7 +1993,7 @@ static int try_dedup_block(handle_t * handle, struct buffer_head *bh) {
 
    dedupfs_debug("no duplicate block\n");
 
-	int ref_count = dedupfs_block_ref(handle, sb, bh->b_blocknr);
+	ref_count = dedupfs_block_ref(handle, sb, bh->b_blocknr);
 
    //TODO: if refcount > 1, do COW
    //or always to COW here
@@ -1997,9 +2001,6 @@ static int try_dedup_block(handle_t * handle, struct buffer_head *bh) {
 #if 1
    dedupfs_debug("doing copy to new block\n");
 	ref_count = dedupfs_block_ref_dec(handle, sb, bh->b_blocknr);
-   unsigned int bbits;
-   sector_t iblock;
-	int needed_blocks;
    //create new block
    needed_blocks = dedupfs_writepage_trans_blocks(inode) + 1;
    handle = dedupfs_journal_start(inode, needed_blocks);

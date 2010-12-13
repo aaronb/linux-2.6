@@ -411,12 +411,12 @@ SYSCALL_DEFINE4(fstatat64, int, dfd, const char __user *, filename,
 /* Caller is here responsible for sufficient locking (ie. inode->i_lock) */
 void __inode_add_bytes(struct inode *inode, loff_t bytes)
 {
-	inode->i_blocks += (bytes >> inode->i_blkbits);
-	bytes &= ((1 << inode->i_blkbits) - 1);
+	inode->i_blocks += bytes >> 9;
+	bytes &= 511;
 	inode->i_bytes += bytes;
-	if (inode->i_bytes >= (1 << inode->i_blkbits)) {
+	if (inode->i_bytes >= 512) {
 		inode->i_blocks++;
-		inode->i_bytes -= (1 << inode->i_blkbits);
+		inode->i_bytes -= 512;
 	}
 }
 
@@ -432,11 +432,11 @@ EXPORT_SYMBOL(inode_add_bytes);
 void inode_sub_bytes(struct inode *inode, loff_t bytes)
 {
 	spin_lock(&inode->i_lock);
-	inode->i_blocks -= bytes >> inode->i_blkbits;
-	bytes &= ((1 << inode->i_blkbits) - 1);
+	inode->i_blocks -= bytes >> 9;
+	bytes &= 511;
 	if (inode->i_bytes < bytes) {
 		inode->i_blocks--;
-		inode->i_bytes += (1 << inode->i_blkbits);
+		inode->i_bytes += 512;
 	}
 	inode->i_bytes -= bytes;
 	spin_unlock(&inode->i_lock);
@@ -449,7 +449,7 @@ loff_t inode_get_bytes(struct inode *inode)
 	loff_t ret;
 
 	spin_lock(&inode->i_lock);
-	ret = (((loff_t)inode->i_blocks) << (inode->i_blkbits)) + inode->i_bytes;
+	ret = (((loff_t)inode->i_blocks) << 9) + inode->i_bytes;
 	spin_unlock(&inode->i_lock);
 	return ret;
 }
@@ -460,8 +460,8 @@ void inode_set_bytes(struct inode *inode, loff_t bytes)
 {
 	/* Caller is here responsible for sufficient locking
 	 * (ie. inode->i_lock) */
-	inode->i_blocks = bytes >> (inode->i_blkbits);
-	inode->i_bytes = bytes & ((1 << inode->i_blkbits) - 1);
+	inode->i_blocks = bytes >> 9;
+	inode->i_bytes = bytes & 511;
 }
 
 EXPORT_SYMBOL(inode_set_bytes);
