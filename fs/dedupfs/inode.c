@@ -1936,7 +1936,7 @@ static int try_combine_block(handle_t * handle, struct buffer_head *bh,
    }
 
    //combine blocks
-   handle = dedupfs_journal_start(inode, 3);
+   handle = dedupfs_journal_start(inode, 6);
    if (IS_ERR(handle)) {
       return -1;
    }
