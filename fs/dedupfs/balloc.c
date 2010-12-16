@@ -130,7 +130,9 @@ int dedupfs_block_ref_inc(handle_t *handle, struct super_block *sb,
 	bh->b_data[offset_bytes % sb->s_blocksize]++;
 	set_buffer_dirty(bh);
 
-	//dedupfs_journal_dirty_metadata(handle, bh);
+	//set_buffer_uptodate(bh);
+
+	dedupfs_journal_dirty_data(handle, bh);
 
 	unlock_buffer(bh);
 	//brelse(bh);	
@@ -170,7 +172,8 @@ int dedupfs_block_ref_dec(handle_t *handle, struct super_block *sb,
 	bh->b_data[offset_bytes % sb->s_blocksize]--;
 	set_buffer_dirty(bh);
 
-	//dedupfs_journal_dirty_metadata(handle, bh);
+	//dedupfs_journal_dirty_data(handle, bh);
+	dedupfs_journal_dirty_data(handle, bh);
 
 	unlock_buffer(bh);
 	//brelse(bh);	

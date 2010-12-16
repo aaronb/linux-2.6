@@ -1,4 +1,8 @@
 #include "hashcache.h"
+#include <linux/mutex.h>
+#include <linux/string.h>
+
+DEFINE_MUTEX(lock);
 
 int hashcache_split_hashval(hash_cache_t *hc, char *hashval, char *tag, ht_index_t *idx) {
     // strip out the item bytes
@@ -51,6 +55,8 @@ int hashcache_init(hash_cache_t *hc, size_t cache_size, size_t hashlen) {
     }
     
     hc->evict_bucket = 0;
+
+	mutex_init(&lock);
     
     return 0;
 }
@@ -89,9 +95,6 @@ int hashcache_insert(hash_cache_t *hc, char *hashval, block_ptr_t blknum) {
     char tag[hc->tag_len];
     ht_item_t *prev, *item, *new_item;
 
-    // if there are no free items, we need to evict something
-    if (hc->free_items == NULL) hashcache_evict(hc);
-    
     hashcache_split_hashval(hc, hashval, tag, &idx);
     
     prev = NULL;
@@ -99,12 +102,25 @@ int hashcache_insert(hash_cache_t *hc, char *hashval, block_ptr_t blknum) {
     while (item != NULL) {
         // existing item with this hash value?
         if (memcmp(item->tag, tag, hc->tag_len) == 0) {
+		mutex_unlock(&lock);
             return -1; // duplicate found
         }
         prev = item;
         item = item->next;
+    }    
+
+    mutex_lock(&lock);
+
+    // if there are no free items, we need to evict something
+    if (hc->free_items == NULL) hashcache_evict(hc);
+
+    if(hc->free_items == NULL) {
+	    //printk(KERN_ERR "hc->free_items null after eviction\n");
+	    mutex_unlock(&lock);
+	    return -1;
     }
-    
+
+
     // insertion point found, need to grab a new item from the pool
     new_item = hc->free_items;
     hc->free_items = hc->free_items->next;
@@ -120,6 +136,8 @@ int hashcache_insert(hash_cache_t *hc, char *hashval, block_ptr_t blknum) {
     } else {
         prev->next = new_item;
     }
+
+    mutex_unlock(&lock);
     
     return 0;
 }
@@ -210,6 +228,11 @@ void hashcache_evict(hash_cache_t *hc) {
             hc->free_items = item;
             return;
         }
+    }
+
+    if(hc->free_items == NULL) {
+	    printk(KERN_ERR "hc->free_items null after eviction\n");
+	    return ;
     }
 }
 
