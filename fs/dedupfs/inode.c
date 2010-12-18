@@ -1853,9 +1853,10 @@ static int printhash(handle_t * handle, struct buffer_head *bh) {
 		goto hash_fail;
 
 	dedupfs_to_hex(formated, hash_output, digest_size);
-	dedupfs_debug("block: %ld hash: %s digest: %s data: \"%.20s\"...\n", 
-			(long)bh->b_blocknr, sbi->hash_alg, formated, (char*)bh->b_data);
+	//dedupfs_debug("block: %ld hash: %s digest: %s data: \"%.20s\"...\n", 
+	//		(long)bh->b_blocknr, sbi->hash_alg, formated, (char*)bh->b_data);
 
+	dedupfs_debug("block: %ld hash: %s digest: %s\n", (long)bh->b_blocknr, sbi->hash_alg, formated);
 	
 	return 0;
 
@@ -1889,9 +1890,9 @@ static int get_hash(struct dedupfs_sb_info *sbi, struct buffer_head *bh,
 		goto hash_fail;
 
 	dedupfs_to_hex(formated, digest, sbi->hash_len);
-	dedupfs_debug("block: %ld hash: %s digest: %s data: \"%.20s\"...\n", 
-			(long)bh->b_blocknr, sbi->hash_alg, formated, (char*)bh->b_data);
-	
+	//dedupfs_debug("block: %ld hash: %s digest: %s data: \"%.20s\"...\n", 
+	//		(long)bh->b_blocknr, sbi->hash_alg, formated, (char*)bh->b_data);
+	dedupfs_debug("block: %ld hash: %s digest: %s\n", (long)bh->b_blocknr, sbi->hash_alg, formated);
 	return 0;
 
 hash_fail:
@@ -1967,7 +1968,7 @@ static int try_dedup_block(handle_t * handle, struct buffer_head *bh) {
 	struct dedupfs_sb_info* sbi;
 	char digest[512];
 	block_ptr_t found_block;
-	int ref_count;
+	int ref_count, found_block_ref_count;
 	unsigned int bbits;
 	sector_t iblock;
 	int needed_blocks;
@@ -1984,11 +1985,18 @@ static int try_dedup_block(handle_t * handle, struct buffer_head *bh) {
    ret = hashcache_get(&(sbi->hc), digest, &found_block);
 
    if (ret == 0) {
-      //found block
-      dedupfs_debug("found matching hash, block %lu\n", (long)found_block);
-      ret = try_combine_block(handle, bh, digest, found_block);
-      if (ret == 0)
-         return ret;
+      // found block in the hashcache, need to make sure the match is not a remnant from
+      // a block that has since been freed.  It can't be the block we're currently about
+      // to fill, and it can't have a ref count of 0.
+      found_block_ref_count = dedupfs_block_ref(handle, sb, found_block);
+      dedupfs_debug("hashcache hit, writeblock(%lu) foundblock(%lu), foundref(%d)\n",
+                     (long)bh->b_blocknr, (long)found_block, found_block_ref_count);
+      if (found_block != bh->b_blocknr && found_block_ref_count > 0) {
+         ret = try_combine_block(handle, bh, digest, found_block);
+         if (ret == 0) return ret;
+      } else {
+         dedupfs_debug("Not deduping due to either same block or unreferenced block\n");
+      }
    }
 
    dedupfs_debug("no duplicate block\n");
