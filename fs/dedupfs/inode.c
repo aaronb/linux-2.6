@@ -1993,7 +1993,11 @@ static int try_dedup_block(handle_t * handle, struct buffer_head *bh) {
                      (long)bh->b_blocknr, (long)found_block, found_block_ref_count);
       if (found_block != bh->b_blocknr && found_block_ref_count > 0) {
          ret = try_combine_block(handle, bh, digest, found_block);
-         if (ret == 0) return ret;
+         if (ret == 0) {
+            sbi->dedup_count += 1;
+            dedupfs_debug("Current dedup count %lu", sbi->dedup_count);
+            return ret;
+         }
       } else {
          dedupfs_debug("Not deduping due to either same block or unreferenced block\n");
       }

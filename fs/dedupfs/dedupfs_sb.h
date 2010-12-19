@@ -95,6 +95,7 @@ struct dedupfs_sb_info {
    unsigned int hash_cache_size;
    struct crypto_hash *hash_tfm;
    hash_cache_t hc;
+   unsigned long dedup_count;
 };
 
 static inline spinlock_t *

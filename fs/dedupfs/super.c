@@ -411,6 +411,9 @@ static void dedupfs_put_super (struct super_block * sb)
 	struct dedupfs_super_block *es = sbi->s_es;
 	int i, err;
 
+	// I think this is called when unmounting, hard to tell
+	printk(KERN_INFO "Dedupfs: Current dedup count %lu\n", sbi->dedup_count);
+
 	dquot_disable(sb, -1, DQUOT_USAGE_ENABLED | DQUOT_LIMITS_ENABLED);
 
 	lock_kernel();
@@ -1261,6 +1264,7 @@ set_qf_format:
             return 0;
          }        
          sbi->hash_len = crypto_hash_digestsize(sbi->hash_tfm);
+         sbi->dedup_count = 0;
          break;
       case Opt_hash_cache:
          if (match_int(&args[0], &option))
