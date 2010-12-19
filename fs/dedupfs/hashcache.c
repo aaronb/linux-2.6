@@ -230,8 +230,11 @@ void hashcache_evict(hash_cache_t *hc) {
         }
     }
 
+    /* if hashcache size is not a power of 2, then we can get this*/
     if(hc->free_items == NULL) {
+#ifdef DEDUPFS_DEBUG
 	    printk(KERN_ERR "hc->free_items null after eviction\n");
+#endif
 	    return ;
     }
 }
